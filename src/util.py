@@ -1,6 +1,6 @@
 
 from transformers import PreTrainedConfig
-from transformers.cache_utils import Cache, StaticLayer
+from transformers.cache_utils import Cache, DynamicLayer
 import torch
 import torch.nn.functional as F
 from typing import Any, Optional
@@ -22,36 +22,35 @@ def sample(logits, temperature=1.0):
     return torch.multinomial(probs, num_samples=1)
 
 class SpecializedStaticCache(Cache):
-    def __init__(
-        self,
-        config: PreTrainedConfig,
-        max_cache_len: int,
-        offloading: bool = False,
-        offload_only_non_sliding: bool = True,
-        **kwargs,
-    ):
-        config = config.get_text_config(decoder=True)
-        layers = [SpecializedStaticCacheLayer(max_cache_len=max_cache_len) for _ in range(config.num_hidden_layers)]
-        super().__init__(layers=layers, offloading=offloading, offload_only_non_sliding=offload_only_non_sliding)
+    # layers: list[SpecializedStaticCacheLayer]
+    def __init__( self, config: PreTrainedConfig):
+        layers = [SpecializedStaticCacheLayer() for _ in range(config.num_hidden_layers)]
+        super().__init__(layers=layers)
     
+    def get_seq_end(self):
+        return self.layers[0].seq_end
+
     def mark_tree_update(
-        self, trim_point: int, idx_to_keep: torch.Tensor
+        self, trim_point: int, idx_to_keep: torch.Tensor | None
     ):
         for layer in self.layers:
              layer.mark_tree_update(trim_point, idx_to_keep)
 
-class SpecializedStaticCacheLayer(StaticLayer):
+class SpecializedStaticCacheLayer(DynamicLayer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.seq_end = 0
         self.idx_to_keep = None
     
     def mark_tree_update(
-        self, seq_end: int, idx_to_keep: torch.Tensor
+        self, seq_end: int, idx_to_keep: torch.Tensor | None
     ):
         # We will add the idx to keep in the update
         self.seq_end = seq_end
         self.idx_to_keep = idx_to_keep # [T]
+    
+    def get_seq_length(self) -> int:
+        return self.seq_end + (len(self.idx_to_keep) if self.idx_to_keep is not None else 0)
 
     def update(
         self,
@@ -71,31 +70,19 @@ class SpecializedStaticCacheLayer(StaticLayer):
             tuple[`torch.Tensor`, `torch.Tensor`]: The key and value states.
         """
         # Lazy initialization
-        if not self.is_initialized:
-            self.lazy_initialization(key_states, value_states)
-
-        # Some old models give None for `cache_position` or even omit passing `cache_kwargs` when used as cross-attention,
-        # in which case we should copy the whole Layer (key_states.shape[-2] == self.max_cache_len)
-        assert "cache_position" not in cache_kwargs
-        if self.idx_to_keep is not None:
-            keep_cache_position = torch.arange(len(self.idx_to_keep), device=key_states.device) + self.seq_end
-            self._update_internal(keep_cache_position, self.keys[:, :, self.idx_to_keep], self.values[:, :, self.idx_to_keep])
-            self.seq_end += len(self.idx_to_keep)
-
-        cache_position = torch.arange(key_states.shape[-2], device=key_states.device) + self.seq_end
-        self._update_internal(cache_position, key_states, value_states)
-        self.seq_end += key_states.shape[-2]
+        if self.keys is None or self.values is None:
+            self.keys = key_states
+            self.values = value_states
+            self.is_initialized = True
+        elif self.idx_to_keep is not None:
+            self.keys  = torch.cat((self.keys[:,:,:self.seq_end], self.keys[:, :, self.idx_to_keep], key_states), dim=-2)
+            self.values = torch.cat((self.values[:,:,:self.seq_end], self.values[:, :, self.idx_to_keep], value_states), dim=-2)
+        else :
+            self.keys = torch.cat([self.keys[:, :, :self.seq_end], key_states], dim=-2)
+            self.values = torch.cat([self.values[:, :, :self.seq_end], value_states], dim=-2)
+        
+        self.seq_end = self.keys.shape[2]
         return self.keys, self.values
-
-    def _update_internal(self, cache_position, key_states, value_states):
-        # Update the cache
-        try:
-            self.keys.index_copy_(2, cache_position, key_states)
-            self.values.index_copy_(2, cache_position, value_states)
-        except NotImplementedError:
-            # Fallback for devices like MPS where index_copy_ might not be supported.
-            self.keys[:, :, cache_position] = key_states
-            self.values[:, :, cache_position] = value_states
 
 
 def build_target_layer_ids(num_target_layers: int, num_draft_layers: int):

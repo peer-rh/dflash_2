@@ -139,7 +139,7 @@ class FixedTreeProcessor(TreeProcessor):
                     [[input_ids[0, -1], *[self.MASK_TOKEN_ID] * (self.tree_size - 1)]],
                     device=input_ids.device,
                 )
-            ),
+            ).view(1, 1, self.tree_size, -1),
             tree_position_ids=torch.arange(self.tree_size, device=input_ids.device),
         )
 
@@ -246,7 +246,7 @@ class FixedTreeProcessor(TreeProcessor):
             block_end = (end_idx * N_B) // tree_gen_block_mask.BLOCK_SIZE[0]
             this_mask = tree_gen_block_mask[:, :, block_index:block_end]
             this_mask.mask_mod = get_mask_mod_w_offset(
-                this_mask, _offset=start_idx * N_B
+                this_mask.mask_mod, _offset=start_idx * N_B
             )
             outputs = target(
                 input_ids=input_ids,

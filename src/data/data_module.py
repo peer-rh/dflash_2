@@ -54,7 +54,7 @@ def setup_synthetic_dataset(
 
         padded_seq_lens = [math.ceil(t / FLEX_BS) * FLEX_BS for t in total_length]
         idxs = sorted(
-            range(len(batch["input_ids"])),
+            range(len(total_length)),
             key=lambda i: padded_seq_lens[i],
             reverse=True,
         )
@@ -94,7 +94,7 @@ def setup_synthetic_dataset(
             )
 
             b_answer_intervals[found_bucket].append(
-                [seq_start + batch["prompt_len"][i], seq_end]
+                [seq_start + prompt_lengths[i], seq_end]
             )
 
             b_n_seq[found_bucket] += 1
@@ -111,6 +111,7 @@ def setup_synthetic_dataset(
     dataset = dataset.map(
         preprocess,
         batched=True,
+        batch_size=10_000,
         num_proc=num_workers,
         remove_columns=dataset.column_names,
     )

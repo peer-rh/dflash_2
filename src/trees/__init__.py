@@ -1,4 +1,5 @@
 import torch
+from typing import Optional
 from dataclasses import dataclass
 
 @dataclass
@@ -6,8 +7,8 @@ class TrainingExtras:
     tree_labels: torch.Tensor # [B, N_T, T]
     noise_embds: torch.Tensor # [B, N_T, T, D]
     sequence_position_ids: torch.Tensor #[B, N_T, T]
-    tree_position_ids: torch.Tensor # [B, N_T, T]
-    target_hidden_states: torch.Tensor # tuple([B, S, D],...)
+    tree_position_ids: Optional[torch.Tensor] # [B, N_T, T]
+    target_hidden_states: list[torch.Tensor] # tuple([B, S, D],...)
     tree_masks: torch.Tensor # [B, N_T, T, T] 
 
 @dataclass
@@ -22,7 +23,7 @@ class InferenceExtras:
     tree_masks: torch.Tensor # [1, N_T, T]
     noise_embds: torch.Tensor # [1, N_T, T, D]
     sequence_position_ids: torch.Tensor #[1, N_T, T]
-    tree_position_ids: torch.Tensor # [1, N_T, T]
+    tree_position_ids: Optional[torch.Tensor] # [1, N_T, T]
 
 class TreeProcessor:
     def __init__(self):

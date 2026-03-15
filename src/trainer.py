@@ -1,10 +1,12 @@
 import argparse
+import time
 import json
 from dataclasses import dataclass
 from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal, Sequence, get_args, get_origin
+import time
 
 from jsonargparse import ActionConfigFile, ArgumentParser
 import jsonargparse
@@ -12,12 +14,13 @@ import torch
 import torch.nn.functional as F
 from lightning import Fabric, seed_everything
 from torch.nn.attention.flex_attention import create_block_mask
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 import wandb
 from wandb.integration.lightning.fabric import WandbLogger
 
 from .trees import TreeProcessor
 from .trees.fixed_tree import FixedTreeProcessor
+from .trees.block_tree import BlockTree
 from .util import SpecializedStaticCache, merge_metrics, sample, wall_time
 from .data.data_module import DataModule, DataModuleConfig
 from .models.dflash import DFlashDraftModel
@@ -53,10 +56,11 @@ class Trainer:
     ):
         self.config = config
         self.fabric = Fabric(
-            precision=config.precision,
-            strategy="ddp" if config.ddp else None,
+            precision=config.precision, # type: ignore
+            strategy="ddp" if config.ddp else 'auto',
             loggers=logger,
         )
+        self.fabric.launch()
         self.wandb = logger
         tree_args = tree_args or {}
 
@@ -82,14 +86,16 @@ class Trainer:
             len(self.trainloader) // self.fabric.world_size // config.grad_accum_steps
         )
         self.total_steps = self.steps_per_epoch * config.num_epochs
-        self.tokenizer: AutoTokenizer = AutoTokenizer.from_pretrained(target)
+        self.tokenizer = AutoTokenizer.from_pretrained(target)
+        self.lm_head = lambda x: self.target.lm_head(x.to(self.target.dtype)) # type: ignore
 
         if isinstance(drafter, str):
-            self.drafter = DFlashDraftModel.from_pretrained(drafter)
+            self.drafter = DFlashDraftModel.from_pretrained(drafter, attn_implementation="flex_attention")
         else:
-            self.drafter = DFlashDraftModel(drafter)
+            drafter['attn_implementation'] = "flex_attention"
+            self.drafter: DFlashDraftModel = DFlashDraftModel(drafter)
         self.mask_token_id = getattr(
-            self.drafter, "mask_token_id", self.tokenizer.pad_token_id
+            self.drafter, "mask_token_id", self.tokenizer.pad_token_id # type: ignore
         )
 
         self.optim = torch.optim.AdamW(self.drafter.parameters(), lr=config.lr)
@@ -110,13 +116,15 @@ class Trainer:
         target_dtype = (
             torch.bfloat16 if "bf16" in self.config.precision else torch.bfloat16
         )
-        self.target: AutoModelForCausalLM = AutoModelForCausalLM.from_pretrained(
-            target, dtype=target_dtype
+        self.target = AutoModelForCausalLM.from_pretrained(
+            target, dtype=target_dtype, attn_implementation="flex_attention"
         )
         self.target = self.fabric.to_device(self.target)
 
         if tree_type == "fixed":
             self.tree_processor = FixedTreeProcessor(**tree_args, mask_token_id=self.mask_token_id, device=self.fabric.device)
+        elif tree_type == "block":
+            self.tree_processor = BlockTree(**tree_args, mask_token_id=self.mask_token_id, device=self.fabric.device)
         else:
             raise ValueError(f"Unsupported tree type: {tree_type}")
 
@@ -175,18 +183,18 @@ class Trainer:
                 for user_content in s["turns"]:
                     user_text = user_content[0]
                     messages.append({"role": "user", "content": user_text})
-                    input_text = self.tokenizer.apply_chat_template(
+                    input_text = self.tokenizer.apply_chat_template( 
                         messages,
                         tokenize=False,
                         add_generation_prompt=True,
                         enable_thinking=False,
                     )
-                    input_ids = self.tokenizer.encode(
+                    input_ids = self.tokenizer.encode( 
                         input_text, return_tensors="pt"
                     ).to(self.target.device)
 
                     outputs = self.speculative_generate(
-                        input_ids=input_ids, max_new_tokens=2048
+                        input_ids=input_ids, max_length=2048
                     )
 
                     info["acceptance_lengths"].extend([len(x) for x in outputs.accepted_ids])
@@ -217,18 +225,18 @@ class Trainer:
                 'tps_mean': sum(info["tps"]) / len(info["tps"]),
                 'tps_with_prefill_mean': sum(info["tps_with_prefill"]) / len(info["tps_with_prefill"]),
             }
-            metrics_reduced = self.fabric.reduce(metrics, reduction="mean")
+            metrics_reduced = self.fabric.all_reduce(metrics, reduce_op="mean")
             if self.fabric.is_global_zero:
                 # Histogram + examples only for rank 0; else we aggregate over all gpus
-                self.logger.experiment.log(
+                self.wandb.experiment.log(
                 {
                     f"{split_name}/acceptance_length_histogram": wandb.Histogram(
                         info["acceptance_lengths"]
                     ),
                     f"{split_name}/examples": wandb.Html(text),
-                    f"{split_name}/throughput": metrics_reduced["tps_mean"],
-                    f"{split_name}/throughput_with_prefill": metrics_reduced["tps_with_prefill_mean"],
-                    f"{split_name}/acceptance_length": metrics_reduced["acceptance_length_mean"],
+                    f"{split_name}/throughput": metrics_reduced["tps_mean"], # type: ignore
+                    f"{split_name}/throughput_with_prefill": metrics_reduced["tps_with_prefill_mean"], # type: ignore
+                    f"{split_name}/acceptance_length": metrics_reduced["acceptance_length_mean"], # type: ignore
                 },
                 step=self.global_step,
             )
@@ -270,35 +278,52 @@ class Trainer:
             BLOCK_SIZE=128,
         )
         # tree_pred :: [B, N_T, T, N_VOCAB]
-        tree_preds = self.drafter(
-            noise_embds=tree_extras.noise_embds.view(B, N_T * T, -1),
-            target_context_featues=tree_extras.target_hidden_states,
-            attention_mask=drafter_attention_mask,
-            position_ids=tree_extras.sequence_position_ids.view(B, N_T * T, -1),
-            tree_position_ids=tree_extras.tree_position_ids.view(B, N_T * T, -1),
+        target_ctx_features = self.drafter.extract_ctx_features(tree_extras.target_hidden_states)
+        drafter_position_ids = torch.cat(
+            (
+                position_ids,
+                tree_extras.sequence_position_ids.view(B, N_T * T),
+            ), dim=1
         )
+        if self.config.dev_run:
+            print("--")
+            print("Drafter Inputs:")
+            print("Noise Embeddings:", tree_extras.noise_embds.shape)
+            print("Target Context Features:", target_ctx_features.shape)
+            print("Attention Mask:", drafter_attention_mask[0])
+
+        tree_hs = self.drafter(
+            hidden_states=tree_extras.noise_embds.view(B, N_T * T, -1),
+            target_ctx_features=target_ctx_features,
+            attention_mask=drafter_attention_mask,
+            position_ids=drafter_position_ids,
+            tree_position_ids=tree_extras.tree_position_ids.reshape(B, N_T * T),
+        )
+        tree_logits = self.lm_head(tree_hs).view(B, N_T, T, -1)
 
         loss = F.cross_entropy(
-            tree_preds.view(-1, tree_preds.size(-1)), tree_labels.view(-1), reduction="sum"
+            tree_logits.view(-1, tree_logits.size(-1)), tree_labels.view(-1), reduction="sum"
         )
         if self.config.dev_run:
             print('--')
             print("Process_batch")
-            print("Mask: ", drafter_attention_mask[0])
-            print("Tree Labels:", self.tokenizer.decode(tree_labels[0, 0]))
-            print("Tree Preds:", self.tokenizer.decode(tree_preds.argmax(dim=-1)[0, 0]))
+            print("Tree Labels:",)
+            for i in range(tree_labels.shape[2]):
+                print(self.tokenizer.decode(tree_labels[0, 0, tree_extras.tree_masks[0, 0, i].bool()]))
+
+            print("Tree Preds:", self.tokenizer.decode(tree_logits.argmax(dim=-1)[0, 0]))
             print("Loss:", loss.item())
 
-        pred_ids = tree_preds.argmax(dim=-1)
+        pred_ids = tree_logits.argmax(dim=-1)
         is_correct = pred_ids[:, :, 1:] == tree_labels[:, :, 1:]
 
-        target_labels_aligned = input_ids.gather(
-            tree_extras.sequence_position_ids[:, :, 1:].view(B, N_T * (T - 1)), dim=1
+        target_labels_aligned = input_ids.gather(1, 
+            tree_extras.sequence_position_ids[:, :, 1:].reshape(B, N_T * (T - 1))
         ).view(B, N_T, T - 1)
         depth = tree_extras.sequence_position_ids[:, :, 1:] - anchors[:, :, None] # [B, N_T, T-1]
         is_accepted = target_labels_aligned == pred_ids[:, :, 1:] # [B, N_T, T-1]
         is_accepted = (
-            is_accepted[:, :, None, :] & tree_extras.tree_masks[:, :, 1:]
+            is_accepted[:, :, None, :] & tree_extras.tree_masks[:, :, 1:, 1:]
         ).sum(dim=-1) == depth # [B, N_T, T-1]
         best = (is_accepted * depth).max(dim=-1)
         acceptance_length = best.values + 1
@@ -308,8 +333,8 @@ class Trainer:
             print("Target Labels Aligned:", self.tokenizer.decode(target_labels_aligned[0, 0]))
             print("Is Correct:", is_correct[0, 0])
             print("Is Accepted:", is_accepted[0, 0])
-            print("Best:", best[0, 0])
-            print("Acceptance Length:", acceptance_length[0, 0].item())
+            print("Best:", best.values[0, 0])
+            print("Acceptance Length:", acceptance_length[0,0])
 
         
         metrics = {
@@ -358,12 +383,8 @@ class Trainer:
         extra_ids = []
 
         # Prefill the Ta
-        past_key_values_drafter = SpecializedStaticCache(
-            self.drafter.config, max_cache_len=max_length + num_input_tokens + 128
-        )
-        past_key_values_target = SpecializedStaticCache(
-            self.target.config, max_cache_len=max_length + num_input_tokens + 128
-        )
+        past_key_values_drafter = DynamicCache(config=self.drafter.config)
+        past_key_values_target = SpecializedStaticCache(self.target.config)
 
         start_time = wall_time()
         verifier_out = self.target(
@@ -373,16 +394,18 @@ class Trainer:
             logits_to_keep=1,
             output_hidden_states=True,
         )
+        output_ids[:, :num_input_tokens] = input_ids
         output_ids[:, num_input_tokens] = sample(
             verifier_out.logits[:, 0, :], temperature=self.config.target_temperature
         )[0]
-        target_context_features = self.drafter.extract_target_context_features(
+        target_context_features = self.drafter.extract_ctx_features(
             verifier_out.hidden_states
         )
         post_prefill_time = wall_time() - start_time
         curr_pos = num_input_tokens
         eos_token = self.tokenizer.eos_token_id
-        while curr_pos < max_length:
+        print(eos_token)
+        while curr_pos < max_length + num_input_tokens:
             inference_extras = self.tree_processor.construct_inference_extras(
                 output_ids[:, :curr_pos], self.target
             )
@@ -404,45 +427,43 @@ class Trainer:
                 dim=1,
             )  # [1, T_prev + N_T * T]
             if self.config.dev_run:
-                print("--")
-                print("Drafter Inputs:")
-                print("Position IDs:", position_ids.shape)
-                print("Target Context Features:", target_context_features.shape)
-                print("Noise Embeddings:", noise_embds.shape)
-                print("KV Cache Len: ", past_key_values_drafter.seq_end)
+            #     print("--")
+            #     print("Drafter Inputs:")
+            #     print("Position IDs:", position_ids.shape)
+            #     print("Target Context Features:", target_context_features.shape)
+            #     print("Noise Embeddings:", noise_embds.shape)
+                print("Drafter KV Cache Len: ", past_key_values_drafter.get_seq_length())
 
             drafter_out = self.drafter(
-                noise_embds=inference_extras.noise_embds.view(1, N_T * T, D),
-                target_context_featues=target_context_features,
+                hidden_states=inference_extras.noise_embds.view(1, N_T * T, D),
+                target_ctx_features=target_context_features,
                 position_ids=position_ids,
                 tree_position_ids=inference_extras.tree_position_ids.view(1, N_T * T),
                 past_key_values=past_key_values_drafter,
                 use_cache=True,
             )
-            drafter_logits = self.target.lm_head(
-                drafter_out.last_hidden_state
-            )  # [1, N_T * T, V]
+            drafter_logits = self.lm_head(drafter_out)  # [1, N_T * T, V]
             drafter_preds = sample(drafter_logits, 0.0).view(1, N_T, T)  # [1, N_T, T]
             drafter_preds[:, :, 0] = output_ids[0, curr_pos]
-            past_key_values_drafter.mark_tree_update(curr_pos, None)  # Discard drafted tokens from cache
+            past_key_values_drafter.crop(curr_pos)  # Discard drafted tokens from cache
             if self.config.dev_run:
-                print("--")
-                print("Drafter Outputs:")
-                print("Preds:", self.tokenizer.decode(drafter_preds[0].flatten()))
-                print("KV Cache Len: ", past_key_values_drafter.seq_end)
+            #     print("--")
+            #     print("Drafter Outputs:")
+            #     print("Preds:", self.tokenizer.decode(drafter_preds[0].flatten()).replace("\n", "\\n"))
+                print("Drafter KV Cache Len: ", past_key_values_drafter.get_seq_length())
 
             candidate_extras = self.tree_processor.construct_candidate_extras(
                 drafter_preds,
                 inference_extras.sequence_position_ids,
             )
             if self.config.dev_run:
-                print("--")
-                print("Verifier Inputs:")
-                print("Input_ids:", self.tokenizer.decode(candidate_extras.input_ids[0]))
-                print("Tree Map:", candidate_extras.tree_masks[0].to(torch.float))
-                print("Position Ids:", candidate_extras.sequence_position_ids[0])
-                print("Verifier Cache Len: ", past_key_values_target.seq_end)
-                print("Verifier Cache To Keep: ", past_key_values_target.idx_to_keep)
+            #     print("--")
+            #     print("Verifier Inputs:")
+            #     print("Input_ids:", self.tokenizer.decode(candidate_extras.input_ids[0]).replace("\n", "\\n"))
+            #     print("Tree Map:", candidate_extras.tree_masks[0].to(torch.float))
+            #     print("Position Ids:", candidate_extras.sequence_position_ids[0])
+                print("Verifier Cache Len: ", past_key_values_target.get_seq_end())
+            #     print("Verifier Cache To Keep: ", past_key_values_target.layers[0].idx_to_keep)
 
             def score_mod(score, B, _H, Q, KV):
                 is_pred = KV >= curr_pos
@@ -452,23 +473,23 @@ class Trainer:
 
             verifier_out = self.target(
                 input_ids=candidate_extras.input_ids,
-                position_ids=candidate_extras.position_ids,
+                position_ids=candidate_extras.sequence_position_ids,
                 score_mod=score_mod,
                 past_key_values=past_key_values_target,
                 use_cache=True,
                 output_hidden_states=True,
             )
             verifier_preds = sample(
-                verifier_out.logits, temperature=self.config.target_temperature
-            )[:, :, 0]  # [1, T']
+                verifier_out.logits[0], temperature=self.config.target_temperature
+            )[None, :, 0]  # [1, T']
             verifier_preds_aligned = verifier_preds[
-                :, candidate_extras.parents_idx[1:]
+                :, candidate_extras.parents_idx[0, 1:]
             ]  # [1, T' - 1]
-            if self.config.dev_run:
-                print("--")
-                print("Verifier Outputs:")
-                print("Verifier Preds:", self.tokenizer.decode(verifier_preds[0]))
-                print("Verifier Aligned:", self.tokenizer.decode(verifier_preds_aligned[0]))
+            # if self.config.dev_run:
+            #     print("--")
+            #     print("Verifier Outputs:")
+            #     print("Verifier Preds:", self.tokenizer.decode(verifier_preds[0]).replace("\n", "\\n"))
+            #     print("Verifier Aligned:", self.tokenizer.decode(verifier_preds_aligned[0]).replace("\n", "\\n"))
 
             depth = candidate_extras.sequence_position_ids - curr_pos
             is_equal = candidate_extras.input_ids[:, 1:] == verifier_preds_aligned
@@ -478,24 +499,17 @@ class Trainer:
             best = (is_equal * depth).max(dim=-1)
             best_vertex = best.indices[0]
             acceptance_length = best.values[0].item() + 1
-            acceptance_mask = candidate_extras.tree_masks[best_vertex]
+            acceptance_mask = candidate_extras.tree_masks[0, best_vertex]
 
             positions_to_keep = torch.arange(
                 curr_pos,
                 curr_pos + candidate_extras.input_ids.shape[1],
                 device=input_ids.device,
             )[acceptance_mask]
-            past_key_values_drafter.mark_tree_update(curr_pos, positions_to_keep)
-            target_context_features = self.drafter.extract_target_context_features(
+            past_key_values_target.mark_tree_update(curr_pos, positions_to_keep)
+            target_context_features = self.drafter.extract_ctx_features(
                 verifier_out.hidden_states
             )[:, acceptance_mask]
-            if self.config.dev_run:
-                print("--")
-                print("Acceptance Info:")
-                print("Best Vertex:", best_vertex.item())
-                print("Acceptance Length:", acceptance_length)
-                print("Positions to Keep:", positions_to_keep)
-                print("Accepted Tokens:", self.tokenizer.decode(candidate_extras.input_ids[0, 1:][acceptance_mask]))
 
             output_ids[:, curr_pos : curr_pos + acceptance_length] = (
                 candidate_extras.input_ids[:, acceptance_mask]
@@ -506,9 +520,21 @@ class Trainer:
             )
             extra_ids.append(output_ids[0, curr_pos + acceptance_length].item())
             curr_pos += acceptance_length
+            if self.config.dev_run:
+                print("--")
+                # print("Acceptance Info:")
+                # print("Best Vertex:", best_vertex.item())
+                # print("Acceptance Length:", acceptance_length)
+                # print("Positions to Keep:", positions_to_keep)
+                print("Curr Pos:", curr_pos)
+                print("Accepted Tokens:", self.tokenizer.decode(candidate_extras.input_ids[0, acceptance_mask], skip_special_tokens=False).replace("\n", "\\n"))
+                print("Next Token:", self.tokenizer.decode(verifier_preds[:, best_vertex][0], skip_special_tokens=False).replace("\n", "\\n"))
+                print("Output IDs:", self.tokenizer.decode(output_ids[0, num_input_tokens:curr_pos+1], skip_special_tokens=False).replace("\n", "\\n"))
 
-            if (output_ids == eos_token).any():
+            if (output_ids[0, num_input_tokens:curr_pos+1] == eos_token).any():
+                print("DONE")
                 break
+
 
         done_time = wall_time()
         time_with_prefill = done_time - start_time
@@ -570,7 +596,8 @@ def main() -> Trainer:
 
     try:
         drafter = json.loads(args.drafter)
-    except json.JSONDecodeError:
+    except Exception as e:
+        print(e)
         drafter = args.drafter
 
     logger = WandbLogger(
@@ -583,7 +610,7 @@ def main() -> Trainer:
         drafter=drafter,
         target=args.target,
         logger=logger,
-        data_module=DataModule(instantiated.data),
+        data=instantiated.data,
         tree_type=args.tree_type,
         tree_args=args.tree_args,
     )
@@ -595,4 +622,5 @@ def main() -> Trainer:
 
 
 if __name__ == "__main__":
+    torch.set_float32_matmul_precision('medium')
     main()
