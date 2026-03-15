@@ -1,5 +1,6 @@
 import argparse
 import time
+import os
 import json
 from dataclasses import dataclass
 from dataclasses import fields
@@ -17,6 +18,7 @@ from torch.nn.attention.flex_attention import create_block_mask
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 import wandb
 from wandb.integration.lightning.fabric import WandbLogger
+from lightning.fabric.utilities import AttributeDict
 
 from .trees import TreeProcessor
 from .trees.fixed_tree import FixedTreeProcessor
@@ -157,10 +159,34 @@ class Trainer:
                     self.save_checkpoint()
 
     def save_checkpoint(self):
-        return None
+        state = AttributeDict(
+            drafter=self.drafter,
+            optimizer=self.optim,
+            scheduler=self.scheduler,
+            global_step=self.global_step,
+            config=self.config,
+        )
+        self.fabric.save(
+            os.path.join(
+                self.config.checkpoint_path, f"checkpoint_{self.global_step}.ckpt"
+            ),
+            state,
+        )
+
+    def load_checkpoint(self, checkpoint_path):
+        state = AttributeDict(
+            drafter=self.drafter,
+            optimizer=self.optim,
+            scheduler=self.scheduler,
+            global_step=self.global_step,
+            config=self.config,
+        )
+        self.fabric.load(checkpoint_path, state)
 
     @torch.inference_mode()
     def validate(self):
+        self.target.eval()
+        self.drafter.eval()
         metrics = None
         for batch in self.valloader:
             _, this_metrics = self.process_batch(batch)
@@ -170,6 +196,8 @@ class Trainer:
 
     @torch.inference_mode()
     def validate_quality(self):
+        self.target.eval()
+        self.drafter.eval()
         for split_name, loader in self.quality_loaders.items():
             info = {
                 "acceptance_lengths": [],
@@ -182,6 +210,7 @@ class Trainer:
                 messages: list[dict[str, str]] = []
                 for user_content in s["turns"]:
                     user_text = user_content[0]
+
                     messages.append({"role": "user", "content": user_text})
                     input_text = self.tokenizer.apply_chat_template( 
                         messages,
@@ -248,43 +277,44 @@ class Trainer:
         position_ids = batch["position_ids"]  # [B, S]
         B, S = input_ids.shape
 
-        tree_extras = self.tree_processor.construct_training_extras(
-            input_ids, anchors, document_mask, position_ids, self.target
-        )
-
-        tree_labels = tree_extras.tree_labels  # [B, N_T, T]
-        B, N_T, T = tree_labels.shape
-
-        # Run Drafter
-        def mask_mod(B, _H, Q, KV):
-            Q_TREE = Q // T
-            KV_TREE = ((KV - S) // T) % N_T
-            is_context = KV < S
-            is_causal = KV < anchors[B, Q_TREE]
-            is_same_doc = (
-                document_mask[B, KV_TREE] == document_mask[B, anchors[B, Q_TREE]]
+        with torch.no_grad():
+            tree_extras = self.tree_processor.construct_training_extras(
+                input_ids, anchors, document_mask, position_ids, self.target
             )
 
-            is_same_tree = Q_TREE == KV_TREE
-            return (is_context & is_causal & is_same_doc) | (~is_context & is_same_tree)
+            tree_labels = tree_extras.tree_labels  # [B, N_T, T]
+            B, N_T, T = tree_labels.shape
 
-        drafter_attention_mask = create_block_mask(
-            mask_mod,
-            B,
-            None,
-            N_T * T,
-            N_T * T + S,
-            device=input_ids.device,
-            BLOCK_SIZE=128,
-        )
-        # tree_pred :: [B, N_T, T, N_VOCAB]
-        target_ctx_features = self.drafter.extract_ctx_features(tree_extras.target_hidden_states)
-        drafter_position_ids = torch.cat(
-            (
-                position_ids,
-                tree_extras.sequence_position_ids.view(B, N_T * T),
-            ), dim=1
-        )
+            # Run Drafter
+            def mask_mod(B, _H, Q, KV):
+                Q_TREE = Q // T
+                KV_TREE = ((KV - S) // T)
+                is_context = KV < S
+                is_causal = KV < anchors[B, Q_TREE]
+                is_same_doc = (
+                    document_mask[B, KV % S] == document_mask[B, anchors[B, Q_TREE]]
+                )
+
+                is_same_tree = Q_TREE == KV_TREE
+                return (is_context & is_causal & is_same_doc) | (~is_context & is_same_tree)
+
+            drafter_attention_mask = create_block_mask(
+                mask_mod,
+                B,
+                None,
+                N_T * T,
+                N_T * T + S,
+                device=input_ids.device,
+                BLOCK_SIZE=128,
+            )
+            # tree_pred :: [B, N_T, T, N_VOCAB]
+            target_ctx_features = self.drafter.extract_ctx_features(tree_extras.target_hidden_states)
+            drafter_position_ids = torch.cat(
+                (
+                    position_ids,
+                    tree_extras.sequence_position_ids.view(B, N_T * T),
+                ), dim=1
+            )
         if self.config.dev_run:
             print("--")
             print("Drafter Inputs:")
@@ -297,7 +327,7 @@ class Trainer:
             target_ctx_features=target_ctx_features,
             attention_mask=drafter_attention_mask,
             position_ids=drafter_position_ids,
-            tree_position_ids=tree_extras.tree_position_ids.reshape(B, N_T * T),
+            tree_position_ids=tree_extras.tree_position_ids.reshape(B, N_T * T) if tree_extras.tree_position_ids is not None else None,
         )
         tree_logits = self.lm_head(tree_hs).view(B, N_T, T, -1)
 
@@ -307,9 +337,9 @@ class Trainer:
         if self.config.dev_run:
             print('--')
             print("Process_batch")
-            print("Tree Labels:",)
-            for i in range(tree_labels.shape[2]):
-                print(self.tokenizer.decode(tree_labels[0, 0, tree_extras.tree_masks[0, 0, i].bool()]))
+            # print("Tree Labels:",)
+            # for i in range(tree_labels.shape[2]):
+                # print(self.tokenizer.decode(tree_labels[0, 0, tree_extras.tree_masks[0, 0, i].bool()]))
 
             print("Tree Preds:", self.tokenizer.decode(tree_logits.argmax(dim=-1)[0, 0]))
             print("Loss:", loss.item())
@@ -401,13 +431,12 @@ class Trainer:
         target_context_features = self.drafter.extract_ctx_features(
             verifier_out.hidden_states
         )
-        post_prefill_time = wall_time() - start_time
+        post_prefill_time = wall_time() 
         curr_pos = num_input_tokens
         eos_token = self.tokenizer.eos_token_id
-        print(eos_token)
         while curr_pos < max_length + num_input_tokens:
             inference_extras = self.tree_processor.construct_inference_extras(
-                output_ids[:, :curr_pos], self.target
+                output_ids[:, :curr_pos+1], self.target
             )
             noise_embds = inference_extras.noise_embds
             B, N_T, T, D = noise_embds.shape
@@ -427,18 +456,18 @@ class Trainer:
                 dim=1,
             )  # [1, T_prev + N_T * T]
             if self.config.dev_run:
-            #     print("--")
-            #     print("Drafter Inputs:")
-            #     print("Position IDs:", position_ids.shape)
-            #     print("Target Context Features:", target_context_features.shape)
-            #     print("Noise Embeddings:", noise_embds.shape)
+                print("--")
+                print("Drafter Inputs:")
+                print("Position IDs:", position_ids)
+                print("Target Context Features:", target_context_features.shape)
+                print("Noise Embeddings:", noise_embds.shape)
                 print("Drafter KV Cache Len: ", past_key_values_drafter.get_seq_length())
 
             drafter_out = self.drafter(
                 hidden_states=inference_extras.noise_embds.view(1, N_T * T, D),
                 target_ctx_features=target_context_features,
                 position_ids=position_ids,
-                tree_position_ids=inference_extras.tree_position_ids.view(1, N_T * T),
+                tree_position_ids=(inference_extras.tree_position_ids.view(1, N_T * T) if inference_extras.tree_position_ids is not None else None),
                 past_key_values=past_key_values_drafter,
                 use_cache=True,
             )
@@ -447,9 +476,9 @@ class Trainer:
             drafter_preds[:, :, 0] = output_ids[0, curr_pos]
             past_key_values_drafter.crop(curr_pos)  # Discard drafted tokens from cache
             if self.config.dev_run:
-            #     print("--")
-            #     print("Drafter Outputs:")
-            #     print("Preds:", self.tokenizer.decode(drafter_preds[0].flatten()).replace("\n", "\\n"))
+                print("--")
+                print("Drafter Outputs:")
+                print("Preds:", self.tokenizer.decode(drafter_preds[0].flatten()).replace("\n", "\\n"))
                 print("Drafter KV Cache Len: ", past_key_values_drafter.get_seq_length())
 
             candidate_extras = self.tree_processor.construct_candidate_extras(
@@ -457,13 +486,13 @@ class Trainer:
                 inference_extras.sequence_position_ids,
             )
             if self.config.dev_run:
-            #     print("--")
-            #     print("Verifier Inputs:")
-            #     print("Input_ids:", self.tokenizer.decode(candidate_extras.input_ids[0]).replace("\n", "\\n"))
-            #     print("Tree Map:", candidate_extras.tree_masks[0].to(torch.float))
-            #     print("Position Ids:", candidate_extras.sequence_position_ids[0])
+                print("--")
+                print("Verifier Inputs:")
+                print("Input_ids:", self.tokenizer.decode(candidate_extras.input_ids[0]).replace("\n", "\\n"))
+                # print("Tree Map:", candidate_extras.tree_masks[0].to(torch.float))
+                print("Position Ids:", candidate_extras.sequence_position_ids[0])
                 print("Verifier Cache Len: ", past_key_values_target.get_seq_end())
-            #     print("Verifier Cache To Keep: ", past_key_values_target.layers[0].idx_to_keep)
+                print("Verifier Cache To Keep: ", past_key_values_target.layers[0].idx_to_keep)
 
             def score_mod(score, B, _H, Q, KV):
                 is_pred = KV >= curr_pos
@@ -485,11 +514,13 @@ class Trainer:
             verifier_preds_aligned = verifier_preds[
                 :, candidate_extras.parents_idx[0, 1:]
             ]  # [1, T' - 1]
-            # if self.config.dev_run:
-            #     print("--")
-            #     print("Verifier Outputs:")
-            #     print("Verifier Preds:", self.tokenizer.decode(verifier_preds[0]).replace("\n", "\\n"))
-            #     print("Verifier Aligned:", self.tokenizer.decode(verifier_preds_aligned[0]).replace("\n", "\\n"))
+            if self.config.dev_run:
+                print("--")
+                print("Verifier Outputs:")
+                print("Verifier Preds:", self.tokenizer.decode(verifier_preds[0]).replace("\n", "\\n"))
+                print("Verifier Aligned:", self.tokenizer.decode(verifier_preds_aligned[0]).replace("\n", "\\n"))
+                print("candidates:", candidate_extras.input_ids[0, 1:])
+                print("verifier:", verifier_preds_aligned[0])
 
             depth = candidate_extras.sequence_position_ids - curr_pos
             is_equal = candidate_extras.input_ids[:, 1:] == verifier_preds_aligned
@@ -522,17 +553,17 @@ class Trainer:
             curr_pos += acceptance_length
             if self.config.dev_run:
                 print("--")
-                # print("Acceptance Info:")
-                # print("Best Vertex:", best_vertex.item())
-                # print("Acceptance Length:", acceptance_length)
-                # print("Positions to Keep:", positions_to_keep)
+                print("Acceptance Info:")
+                print("Best Vertex:", best_vertex.item())
+                print("Acceptance Length:", acceptance_length)
+                print("Positions to Keep:", positions_to_keep)
                 print("Curr Pos:", curr_pos)
                 print("Accepted Tokens:", self.tokenizer.decode(candidate_extras.input_ids[0, acceptance_mask], skip_special_tokens=False).replace("\n", "\\n"))
                 print("Next Token:", self.tokenizer.decode(verifier_preds[:, best_vertex][0], skip_special_tokens=False).replace("\n", "\\n"))
                 print("Output IDs:", self.tokenizer.decode(output_ids[0, num_input_tokens:curr_pos+1], skip_special_tokens=False).replace("\n", "\\n"))
 
             if (output_ids[0, num_input_tokens:curr_pos+1] == eos_token).any():
-                print("DONE")
+                # print("DONE", num_input_tokens, curr_pos)
                 break
 
 
@@ -549,12 +580,12 @@ class Trainer:
         )
 
     def log_metrics(self, metrics, prefix=None):
-        reduced_metrics: dict[str, float] = self.fabric.all_reduce(metrics, reduce_op="sum")
+        reduced_metrics: dict[str, float] = self.fabric.all_reduce(metrics, reduce_op="sum") # type: ignore
         if not self.fabric.is_global_zero:
             return
 
         metrics = {
-            "lm_loss" : reduced_metrics['lm_loss_sum'] / reduced_metrics['batch_count'], 
+            "lm_loss" : reduced_metrics['lm_loss_sum'] / reduced_metrics['token_count'], 
             "total_accuracy": reduced_metrics['token_correct_count'] / reduced_metrics['token_count'], 
             "accepted_length": reduced_metrics['accepted_length_sum'] / reduced_metrics['block_count'],
         }
@@ -568,6 +599,20 @@ class Trainer:
             metrics = {f"{prefix}/{k}": v for k, v in metrics.items()}
         self.fabric.log_dict(metrics, step=self.global_step)
 
+    def naive_generate(self, input_ids: torch.Tensor, max_length: int):
+        output_ids = input_ids
+        past_key_values = DynamicCache()
+        start = wall_time()
+        for _ in range(max_length):
+            out = self.target(input_ids=output_ids[:, past_key_values.get_seq_length():], past_key_values=past_key_values, use_cache=True)
+            next_token = sample(out.logits[:, -1], temperature=self.config.target_temperature).unsqueeze(0)
+            output_ids = torch.cat((output_ids, next_token), dim=1)
+            past_key_values = out.past_key_values
+        
+        return SimpleNamespace(
+            output_ids=output_ids[:, input_ids.shape[1]:],
+            tps_with_prefill=(output_ids.shape[1] - input_ids.shape[1]) / (wall_time() - start),
+        )
 
 def build_parser() -> ArgumentParser:
     parser = jsonargparse.ArgumentParser()

@@ -30,11 +30,11 @@ mkdir -p $checkpoint_path
 
 TARGET_MODEL="Qwen/Qwen3-4B"
 
-uv run -m src.trainer --run_name $EXPERIMENT_NAME --seed 42 --trainer.dev_run true --only-spec-dec \
+uv run -m src.trainer --run_name $EXPERIMENT_NAME --seed 42 --trainer.dev_run true \
     --drafter "z-lab/Qwen3-4B-DFlash-b16" \
     --target $TARGET_MODEL \
     --data.data_path ../dflash/datasets/qwen3-4b/ \
-    --data.batch_size 6 --data.seq_len 2048 --data.n_blocks 64 --data.block_size 24 \
+    --data.batch_size 2 --data.seq_len 2048 --data.n_blocks 32 --data.block_size 24 \
     --data.num_workers 4 --trainer.checkpoint_path $checkpoint_path \
     --trainer.grad_accum_steps 4 --trainer.log_every 10 --trainer.num_epochs 32  --trainer.eval_every 1024 \
-    --tree_type block --tree_args "{'block_size': 16}" --trainer.ddp false
+    --tree_type block --tree_args "{'block_size': 16}" --trainer.ddp false --trainer.precision 'bf16-true'

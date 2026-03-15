@@ -170,8 +170,11 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.block_size = config.block_size
         self.mask_token_id = self.config.dflash_config.get("mask_token_id", None)
-        if hasattr(config, "use_tree_pos_emb") and config.use_tree_pos_emb:
+        if not hasattr(config, "use_tree_pos_emb"):
+            self.config.use_tree_pos_emb = False
+        if self.config.use_tree_pos_emb:
             self.tree_pos_embd = nn.Embedding(config.max_tree_size, config.hidden_size)
+        
         self.post_init()
 
     def extract_ctx_features(self, hidden_states: list[torch.Tensor]) -> torch.Tensor:
