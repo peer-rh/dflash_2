@@ -5,8 +5,8 @@
 #SBATCH --mem=48G
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=4
-#SBATCH --gres=gpu:2
-#SBATCH --nodelist=tikgpu06 # Specify that it should run on this particular node
+#SBATCH --gres=gpu:1
+#SBATCH --nodelist=tikgpu10 # Specify that it should run on this particular node
 #CommentSBATCH --account=tik-internal
 #CommentSBATCH --constraint='geforce_rtx_3090'
 #CommentSBATCH --constraint='rtx_a6000'

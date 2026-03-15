@@ -132,6 +132,8 @@ class Trainer:
             raise ValueError(f"Unsupported tree type: {tree_type}")
 
         self.global_step = 0
+        if self.config.dev_run:
+            self.config.num_epochs = 1
 
     def fit(self):
         for epoch in range(self.config.num_epochs):
@@ -148,6 +150,10 @@ class Trainer:
                 metrics = merge_metrics(metrics, this_metrics)
                 if not should_step:
                     continue
+
+                if self.config.dev_run and batch_idx > 20:
+                    break
+
                 if self.global_step % self.config.eval_every == 0:
                     self.validate()
                     self.validate_quality()
@@ -159,6 +165,11 @@ class Trainer:
                     metrics = None
                 if self.global_step % self.config.save_every == 0:
                     self.save_checkpoint()
+        print("Fit done; Running final validation...")
+        self.validate()
+        self.validate_quality()
+        self.log_metrics(metrics, prefix="train")
+        self.save_checkpoint()
 
     def save_checkpoint(self):
         state = AttributeDict(
