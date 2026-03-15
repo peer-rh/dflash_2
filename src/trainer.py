@@ -151,17 +151,13 @@ class Trainer:
             metrics = None
             total_batches = len(self.trainloader)
             for batch_idx, batch in enumerate(self.trainloader, start=1):
-                should_step = (
-                    batch_idx % self.config.grad_accum_steps == 0
-                    or batch_idx == total_batches
+                self.global_step += 1
+                should_step = self.global_step % self.config.grad_accum_steps == 0
                 )
                 _, this_metrics = self.train_step(
                     batch, is_accumulating=not should_step
                 )
                 metrics = merge_metrics(metrics, this_metrics)
-                if not should_step:
-                    continue
-
                 if self.config.dev_run and batch_idx > 20:
                     break
 
@@ -417,7 +413,6 @@ class Trainer:
         with self.fabric.no_backward_sync(self.drafter, enabled=is_accumulating):
             loss, metrics = self._train_inner(batch)
         if not is_accumulating:
-            self.global_step += 1
             self.fabric.clip_gradients(
                 self.drafter,
                 self.optim,
