@@ -155,12 +155,9 @@ class Trainer:
                     batch_idx % self.config.grad_accum_steps == 0
                     or batch_idx == total_batches
                 )
-                start = wall_time()
                 _, this_metrics = self.train_step(
                     batch, is_accumulating=not should_step
                 )
-                end = wall_time()
-                print(f"Batch {batch_idx} processed in {end - start:.4f} seconds")
                 metrics = merge_metrics(metrics, this_metrics)
                 if not should_step:
                     continue
