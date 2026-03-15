@@ -93,11 +93,11 @@ TREE_JSON=$(cat <<EOF
 EOF
 )
 
-uv run -m src.trainer --run_name $EXPERIMENT_NAME --seed 42 --trainer.compile true \
+uv run -m src.trainer --run_name $EXPERIMENT_NAME --seed 42 --trainer.compile true --trainer.verbose false \
     --drafter "$MODEL_JSON" \
     --target $TARGET_MODEL \
     --data.data_path ../dflash/datasets/qwen3-4b/ \
-    --data.batch_size 16 --data.seq_len 3072 --data.n_blocks 64 --data.block_size 24 \
+    --data.batch_size 24 --data.seq_len 3072 --data.n_blocks 64 --data.block_size 24 \
     --data.num_workers 4 --trainer.checkpoint_path $checkpoint_path \
-    --trainer.grad_accum_steps 8 --trainer.log_every 10 --trainer.num_epochs 8  --trainer.eval_every 1024 \
+    --trainer.grad_accum_steps 3 --trainer.log_every 10 --trainer.num_epochs 8  --trainer.eval_every 1024 \
     --tree_type fixed --tree_args "$TREE_JSON" --trainer.ddp false --trainer.precision 'bf16-true'

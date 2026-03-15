@@ -3,6 +3,7 @@ from typing import Sequence
 import torch
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask
+from transformers.cache_utils import StaticCache
 
 from . import TreeProcessor, CandidateExtras, InferenceExtras, TrainingExtras
 from ..util import get_mask_mod_w_offset
@@ -168,17 +169,25 @@ class FixedTreeProcessor(TreeProcessor):
             device=input_ids.device,
         )
 
+        TS_MOD = self.no_leaf_no_left_mask.shape[0]
+
+        past_key_values = StaticCache(
+            config=target.config,
+            max_cache_len=S + N_B * TS_MOD,
+        )
+        prefill_cache_position = torch.arange(S, device=input_ids.device)
+
         prefill_out = target(
             input_ids=input_ids,
             position_ids=position_ids,
-            output_hidden_states=True,
+            # output_hidden_states=True,
             attn_mask=prefill_mask,
+            past_key_values=past_key_values,
+            cache_position=prefill_cache_position,
             use_cache=True,
         )
         target_hidden_states = prefill_out.hidden_states
         logits = prefill_out.logits
-        # TODO: Check if this is compilable or we should switch to a static-cache
-        past_key_values = prefill_out.past_key_values
 
         left_most_indexes = torch.nonzero(self.is_left_most, as_tuple=True)[0]
         tree_labels = torch.zeros(
@@ -196,7 +205,7 @@ class FixedTreeProcessor(TreeProcessor):
             tree_labels[:, :, is_child] = this_logits_topk[:, :, child_ranks]
 
         next_input_idx = torch.arange(self.tree_size, device=input_ids.device)[
-            self.distance_to_left_most == 1
+            (self.distance_to_left_most == 1) & ~self.is_leaf
         ]
         TS_MOD = self.no_leaf_no_left_mask.shape[0]
 
@@ -228,6 +237,7 @@ class FixedTreeProcessor(TreeProcessor):
             device=input_ids.device,
         )
 
+        curr_cache_pos = S
         while next_input_idx.size(0) > 0:
             position_ids = (
                 (
@@ -253,8 +263,12 @@ class FixedTreeProcessor(TreeProcessor):
                 position_ids=position_ids,
                 use_cache=True,
                 past_key_values=past_key_values,
+                cache_position=(
+                    curr_cache_pos + torch.arange(input_ids.shape[1], device=input_ids.device)
+                ),
                 attn_mask=this_mask,
             )
+            curr_cache_pos += input_ids.shape[1]
             this_logits = outputs.logits.view(B, -1, N_B, logits.shape[-1]).transpose(
                 1, 2
             )  # [B, N_B, width, vocab_size]
@@ -272,4 +286,5 @@ class FixedTreeProcessor(TreeProcessor):
             next_input_idx = torch.nonzero(all_children & ~self.is_leaf, as_tuple=True)[
                 0
             ]
+            
         return target_hidden_states, tree_labels

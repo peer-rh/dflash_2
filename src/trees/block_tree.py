@@ -54,7 +54,7 @@ class BlockTree(TreeProcessor):
         prefill_out = target(
             input_ids=input_ids,
             position_ids=position_ids,
-            output_hidden_states=True,
+            # output_hidden_states=True,
             attn_mask=prefill_mask,
         )
         target_hidden_states = prefill_out.hidden_states

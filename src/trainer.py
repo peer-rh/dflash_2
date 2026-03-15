@@ -23,7 +23,7 @@ from lightning.fabric.utilities import AttributeDict
 from .trees import TreeProcessor
 from .trees.fixed_tree import FixedTreeProcessor
 from .trees.block_tree import BlockTree
-from .util import SpecializedStaticCache, merge_metrics, sample, wall_time
+from .util import SpecializedDynamicCache, merge_metrics, sample, wall_time
 from .data.data_module import DataModule, DataModuleConfig
 from .models.dflash import DFlashDraftModel
 from .models.qwen3 import Qwen3ForCausalLM
@@ -144,7 +144,7 @@ class Trainer:
         
         if self.config.compile:
             self.process_batch = torch.compile(self.process_batch)
-            self.train_step = torch.compile(self.train_step)
+            self._train_inner = torch.compile(self._train_inner)
 
     def fit(self):
         for epoch in range(self.config.num_epochs):
@@ -155,12 +155,12 @@ class Trainer:
                     batch_idx % self.config.grad_accum_steps == 0
                     or batch_idx == total_batches
                 )
-                # start = wall_time()
+                start = wall_time()
                 _, this_metrics = self.train_step(
                     batch, is_accumulating=not should_step
                 )
-                # end = wall_time()
-                # print(f"Batch {batch_idx} processed in {end - start:.4f} seconds")
+                end = wall_time()
+                print(f"Batch {batch_idx} processed in {end - start:.4f} seconds")
                 metrics = merge_metrics(metrics, this_metrics)
                 if not should_step:
                     continue
@@ -215,9 +215,11 @@ class Trainer:
         self.target.eval()
         self.drafter.eval()
         metrics = None
-        for batch in self.valloader:
+        for i, batch in enumerate(self.valloader):
             _, this_metrics = self.process_batch(batch)
             metrics = merge_metrics(metrics, this_metrics)
+            if self.config.dev_run and i > 20:
+                break
         self.log_metrics(metrics, prefix="val")
         return metrics
 
@@ -367,9 +369,9 @@ class Trainer:
         if self.config.verbose:
             print('--')
             print("Process_batch")
-            # print("Tree Labels:",)
-            # for i in range(tree_labels.shape[2]):
-                # print(self.tokenizer.decode(tree_labels[0, 0, tree_extras.tree_masks[0, 0, i].bool()]))
+            print("Tree Labels:",)
+            for i in range(tree_labels.shape[2]):
+                print(self.tokenizer.decode(tree_labels[0, 0, tree_extras.tree_masks[0, 0, i].bool()]))
 
             print("Tree Preds:", self.tokenizer.decode(tree_logits.argmax(dim=-1)[0, 0]))
             print("Loss:", loss.item())
@@ -407,12 +409,16 @@ class Trainer:
         }
         return loss / (B * N_T * T), metrics
 
+    def _train_inner(self, batch):
+        loss, metrics = self.process_batch(batch)
+        self.fabric.backward(loss)
+        return loss, metrics
+
     def train_step(self, batch, is_accumulating: bool = True):
         self.drafter.train()
         self.target.eval()
         with self.fabric.no_backward_sync(self.drafter, enabled=is_accumulating):
-            loss, metrics = self.process_batch(batch)
-            self.fabric.backward(loss)
+            loss, metrics = self._train_inner(batch)
         if not is_accumulating:
             self.global_step += 1
             self.fabric.clip_gradients(
@@ -444,7 +450,7 @@ class Trainer:
 
         # Prefill the Ta
         past_key_values_drafter = DynamicCache(config=self.drafter.config)
-        past_key_values_target = SpecializedStaticCache(self.target.config)
+        past_key_values_target = SpecializedDynamicCache(self.target.config)
 
         start_time = wall_time()
         verifier_out = self.target(
@@ -452,7 +458,7 @@ class Trainer:
             past_key_values=past_key_values_target,
             use_cache=True,
             logits_to_keep=1,
-            output_hidden_states=True,
+            # output_hidden_states=True,
         )
         output_ids[:, :num_input_tokens] = input_ids
         output_ids[:, num_input_tokens] = sample(
@@ -536,7 +542,7 @@ class Trainer:
                 score_mod=score_mod,
                 past_key_values=past_key_values_target,
                 use_cache=True,
-                output_hidden_states=True,
+                # output_hidden_states=True,
             )
             verifier_preds = sample(
                 verifier_out.logits[0], temperature=self.config.target_temperature
@@ -627,6 +633,9 @@ class Trainer:
         
         if prefix:
             metrics = {f"{prefix}/{k}": v for k, v in metrics.items()}
+        metrics['trainer/global_step'] = self.global_step
+        metrics['trainer/learning_rate'] = self.scheduler.get_last_lr()[0] # type: ignore
+
         self.fabric.log_dict(metrics, step=self.global_step)
 
     def naive_generate(self, input_ids: torch.Tensor, max_length: int):
@@ -698,6 +707,6 @@ def main() -> Trainer:
 
 if __name__ == "__main__":
     torch._dynamo.config.cache_size_limit = 64
-    torch.set_float32_matmul_precision('medium')
     torch._dynamo.config.allow_unspec_int_on_nn_module = True
+    torch.set_float32_matmul_precision('medium')
     main()

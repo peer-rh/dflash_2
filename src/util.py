@@ -21,10 +21,10 @@ def sample(logits, temperature=1.0):
     probs = F.softmax(logits / temperature, dim=-1)
     return torch.multinomial(probs, num_samples=1)
 
-class SpecializedStaticCache(Cache):
+class SpecializedDynamicCache(Cache):
     # layers: list[SpecializedStaticCacheLayer]
     def __init__( self, config: PreTrainedConfig):
-        layers = [SpecializedStaticCacheLayer() for _ in range(config.num_hidden_layers)]
+        layers = [SpecializedDynamicCacheLayer() for _ in range(config.num_hidden_layers)]
         super().__init__(layers=layers)
     
     def get_seq_end(self):
@@ -36,7 +36,7 @@ class SpecializedStaticCache(Cache):
         for layer in self.layers:
              layer.mark_tree_update(trim_point, idx_to_keep)
 
-class SpecializedStaticCacheLayer(DynamicLayer):
+class SpecializedDynamicCacheLayer(DynamicLayer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.seq_end = 0
