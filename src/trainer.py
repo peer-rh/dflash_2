@@ -42,6 +42,7 @@ class TrainerConfig:
     grad_accum_steps: int = 1
     dev_run: bool = False
     checkpoint_path: str = "checkpoints"
+    compile: bool = False
 
 
 class Trainer:
@@ -149,6 +150,7 @@ class Trainer:
                     continue
                 if self.global_step % self.config.eval_every == 0:
                     self.validate()
+                    self.validate_quality()
                 if self.global_step % self.config.log_every == 0:
                     print(
                         f"Epoch {epoch} / {self.config.num_epochs} - Step {self.global_step} / {self.steps_per_epoch}"
