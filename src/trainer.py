@@ -41,6 +41,7 @@ class TrainerConfig:
     warmup_steps: int = 128
     grad_accum_steps: int = 1
     dev_run: bool = False
+    verbose: bool = False
     checkpoint_path: str = "checkpoints"
     compile: bool = False
 
@@ -134,6 +135,9 @@ class Trainer:
         self.global_step = 0
         if self.config.dev_run:
             self.config.num_epochs = 1
+        
+        if self.config.compile:
+            self.process_batch = torch.compile(self.process_batch)
 
     def fit(self):
         for epoch in range(self.config.num_epochs):
@@ -328,7 +332,7 @@ class Trainer:
                     tree_extras.sequence_position_ids.view(B, N_T * T),
                 ), dim=1
             )
-        if self.config.dev_run:
+        if self.config.verbose:
             print("--")
             print("Drafter Inputs:")
             print("Noise Embeddings:", tree_extras.noise_embds.shape)
@@ -347,7 +351,7 @@ class Trainer:
         loss = F.cross_entropy(
             tree_logits.view(-1, tree_logits.size(-1)), tree_labels.view(-1), reduction="sum"
         )
-        if self.config.dev_run:
+        if self.config.verbose:
             print('--')
             print("Process_batch")
             # print("Tree Labels:",)
@@ -370,7 +374,7 @@ class Trainer:
         ).sum(dim=-1) == depth # [B, N_T, T-1]
         best = (is_accepted * depth).max(dim=-1)
         acceptance_length = best.values + 1
-        if self.config.dev_run:
+        if self.config.verbose:
             print('--')
             print("Acceptance Info:")
             print("Target Labels Aligned:", self.tokenizer.decode(target_labels_aligned[0, 0]))
@@ -468,7 +472,7 @@ class Trainer:
                 ),
                 dim=1,
             )  # [1, T_prev + N_T * T]
-            if self.config.dev_run:
+            if self.config.verbose:
                 print("--")
                 print("Drafter Inputs:")
                 print("Position IDs:", position_ids)
@@ -488,7 +492,7 @@ class Trainer:
             drafter_preds = sample(drafter_logits, 0.0).view(1, N_T, T)  # [1, N_T, T]
             drafter_preds[:, :, 0] = output_ids[0, curr_pos]
             past_key_values_drafter.crop(curr_pos)  # Discard drafted tokens from cache
-            if self.config.dev_run:
+            if self.config.verbose:
                 print("--")
                 print("Drafter Outputs:")
                 print("Preds:", self.tokenizer.decode(drafter_preds[0].flatten()).replace("\n", "\\n"))
@@ -498,7 +502,7 @@ class Trainer:
                 drafter_preds,
                 inference_extras.sequence_position_ids,
             )
-            if self.config.dev_run:
+            if self.config.verbose:
                 print("--")
                 print("Verifier Inputs:")
                 print("Input_ids:", self.tokenizer.decode(candidate_extras.input_ids[0]).replace("\n", "\\n"))
@@ -527,7 +531,7 @@ class Trainer:
             verifier_preds_aligned = verifier_preds[
                 :, candidate_extras.parents_idx[0, 1:]
             ]  # [1, T' - 1]
-            if self.config.dev_run:
+            if self.config.verbose:
                 print("--")
                 print("Verifier Outputs:")
                 print("Verifier Preds:", self.tokenizer.decode(verifier_preds[0]).replace("\n", "\\n"))
@@ -564,7 +568,7 @@ class Trainer:
             )
             extra_ids.append(output_ids[0, curr_pos + acceptance_length].item())
             curr_pos += acceptance_length
-            if self.config.dev_run:
+            if self.config.verbose:
                 print("--")
                 print("Acceptance Info:")
                 print("Best Vertex:", best_vertex.item())

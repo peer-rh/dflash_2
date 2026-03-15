@@ -5,8 +5,8 @@
 #SBATCH --mem=48G
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=4
-#SBATCH --gres=gpu:1
-#SBATCH --nodelist=tikgpu10 # Specify that it should run on this particular node
+#SBATCH --gres=gpu:2
+#SBATCH --nodelist=tikgpu06 # Specify that it should run on this particular node
 #CommentSBATCH --account=tik-internal
 #CommentSBATCH --constraint='geforce_rtx_3090'
 #CommentSBATCH --constraint='rtx_a6000'
@@ -93,7 +93,7 @@ TREE_JSON=$(cat <<EOF
 EOF
 )
 
-uv run -m src.trainer --run_name $EXPERIMENT_NAME --seed 42 \
+uv run -m src.trainer --run_name $EXPERIMENT_NAME --seed 42 --trainer.compile true --trainer.dev_run true \
     --drafter "$MODEL_JSON" \
     --target $TARGET_MODEL \
     --data.data_path ../dflash/datasets/qwen3-4b/ \
