@@ -178,7 +178,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.post_init()
 
     def extract_ctx_features(self, hidden_states: list[torch.Tensor]) -> torch.Tensor:
-        return extract_context_feature(hidden_states, self.target_layer_ids)
+        # return extract_context_feature(hidden_states, self.target_layer_ids)
+        B, S, N, D = hidden_states.shape
+        return hidden_states.view(B,S, N * D)
 
     def forward(
         self,

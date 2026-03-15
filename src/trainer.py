@@ -26,6 +26,7 @@ from .trees.block_tree import BlockTree
 from .util import SpecializedStaticCache, merge_metrics, sample, wall_time
 from .data.data_module import DataModule, DataModuleConfig
 from .models.dflash import DFlashDraftModel
+from .models.qwen3 import Qwen3ForCausalLM
 
 
 @dataclass
@@ -115,14 +116,19 @@ class Trainer:
             ],
             milestones=[config.warmup_steps],
         )
+        # if self.config.compile:
+            # self.drafter = torch.compile(self.drafter)
         self.drafter, self.optim = self.fabric.setup(self.drafter, self.optim)
 
         target_dtype = (
             torch.bfloat16 if "bf16" in self.config.precision else torch.bfloat16
         )
-        self.target = AutoModelForCausalLM.from_pretrained(
+        self.target = Qwen3ForCausalLM.from_pretrained(
             target, dtype=target_dtype, attn_implementation="flex_attention"
-        )
+        )   
+        self.target.model.layers_to_keep = self.drafter.target_layer_ids
+        # if self.config.compile:
+            # self.target = torch.compile(self.target, dynamic=True)
         self.target = self.fabric.to_device(self.target)
 
         if tree_type == "fixed":
@@ -138,6 +144,7 @@ class Trainer:
         
         if self.config.compile:
             self.process_batch = torch.compile(self.process_batch)
+            self.train_step = torch.compile(self.train_step)
 
     def fit(self):
         for epoch in range(self.config.num_epochs):
@@ -148,9 +155,12 @@ class Trainer:
                     batch_idx % self.config.grad_accum_steps == 0
                     or batch_idx == total_batches
                 )
+                # start = wall_time()
                 _, this_metrics = self.train_step(
                     batch, is_accumulating=not should_step
                 )
+                # end = wall_time()
+                # print(f"Batch {batch_idx} processed in {end - start:.4f} seconds")
                 metrics = merge_metrics(metrics, this_metrics)
                 if not should_step:
                     continue
@@ -295,9 +305,12 @@ class Trainer:
         B, S = input_ids.shape
 
         with torch.no_grad():
+            # start = wall_time()
             tree_extras = self.tree_processor.construct_training_extras(
                 input_ids, anchors, document_mask, position_ids, self.target
             )
+            # end = wall_time()
+            # print("Tree extras constructed in", end - start)
 
             tree_labels = tree_extras.tree_labels  # [B, N_T, T]
             B, N_T, T = tree_labels.shape
@@ -684,5 +697,7 @@ def main() -> Trainer:
 
 
 if __name__ == "__main__":
+    torch._dynamo.config.cache_size_limit = 64
     torch.set_float32_matmul_precision('medium')
+    torch._dynamo.config.allow_unspec_int_on_nn_module = True
     main()
