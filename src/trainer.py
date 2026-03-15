@@ -153,7 +153,6 @@ class Trainer:
             for batch_idx, batch in enumerate(self.trainloader, start=1):
                 self.global_step += 1
                 should_step = self.global_step % self.config.grad_accum_steps == 0
-                )
                 _, this_metrics = self.train_step(
                     batch, is_accumulating=not should_step
                 )
