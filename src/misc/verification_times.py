@@ -5,20 +5,23 @@ import pandas as pd
 import torch
 from transformers.cache_utils import DynamicCache
 
-try:
-    from ..models.dflash import DFlashDraftModel
-except ImportError:
-    from src.models.dflash import DFlashDraftModel
+from ..models.qwen3 import Qwen3ForCausalLM
 
 
-HIDDEN_SIZES = [2560, 4096, 5120]
-N_LAYERS = [3, 5, 7]
-TREE_SIZE = [16, 24, 32, 64, 128, 256, 512]
+MODELS = [
+    "qwen/qwen3-4b",
+    "qwen/qwen3-8b",
+    "qwen/qwen3-14b",
+
+]
+BSZ = [1, 2, 4, 8, 16]
+TREE_SIZE = [16, 24, 32, 64, 128]
 KV_LEN = [512, 1024, 2048]
 
 N_WARMUP = 10
 N_TEST = 100
 DTYPE = torch.bfloat16
+
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,45 +33,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_model_config(n_layers: int, hidden_size: int, tree_size: int) -> dict:
-    return {
-        "architectures": ["DFlashDraftModel"],
-        "attention_bias": False,
-        "attention_dropout": 0.0,
-        "block_size": tree_size,
-        "bos_token_id": 151643,
-        "dflash_config": {
-            "mask_token_id": 151669,
-            "target_layer_ids": [1, 9, 17, 25, 33],
-        },
-        "dtype": "bfloat16",
-        "eos_token_id": 151645,
-        "head_dim": 128,
-        "hidden_act": "silu",
-        "hidden_size": hidden_size,
-        "initializer_range": 0.02,
-        "intermediate_size": 9728,
-        "layer_types": ["full_attention"] * n_layers,
-        "max_position_embeddings": 40960,
-        "max_window_layers": n_layers,
-        "model_type": "qwen3",
-        "num_attention_heads": 16,
-        "num_hidden_layers": n_layers,
-        "num_key_value_heads": 8,
-        "num_target_layers": 36,
-        "rms_norm_eps": 1e-6,
-        "rope_scaling": None,
-        "rope_theta": 1_000_000,
-        "sliding_window": None,
-        "tie_word_embeddings": True,
-        "use_cache": True,
-        "use_sliding_window": False,
-        "use_tree_pos_emb": False,
-        "max_tree_size": tree_size,
-        "vocab_size": 151936,
-    }
-
-
 def synchronize(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -76,13 +40,14 @@ def synchronize(device: torch.device) -> None:
 
 @torch.inference_mode()
 def build_random_cache(
-    model: DFlashDraftModel,
+    model: Qwen3ForCausalLM,
+    bsz:int, 
     kv_len: int,
     device: torch.device,
 ) -> DynamicCache:
     cache = DynamicCache(config=model.config)
     hidden_states = torch.randn(
-        1,
+        bsz,
         kv_len,
         model.config.hidden_size,
         device=device,
@@ -90,7 +55,7 @@ def build_random_cache(
     )
     position_ids = torch.arange(kv_len, device=device).unsqueeze(0)
     model(
-        hidden_states=hidden_states,
+        inputs_embeds=hidden_states,
         position_ids=position_ids,
         past_key_values=cache,
         use_cache=True,
@@ -100,28 +65,23 @@ def build_random_cache(
 
 @torch.inference_mode()
 def benchmark_case(
-    n_layers: int,
-    hidden_size: int,
+    model: Qwen3ForCausalLM,
+    bsz: int,
     tree_size: int,
     kv_len: int,
     n_warmup: int,
     n_test: int,
     device: torch.device,
 ) -> dict[str, float | int | str]:
-    model = DFlashDraftModel(build_model_config(n_layers, hidden_size, tree_size)).to(
-        device=device,
-        dtype=DTYPE,
-    )
-    model.eval()
 
     if model.config._attn_implementation != "flex_attention":
         raise RuntimeError(
             f"Expected flex attention, got {model.config._attn_implementation!r}."
         )
 
-    cache = build_random_cache(model, kv_len=kv_len, device=device)
-    draft_hidden_states = torch.randn(
-        1,
+    cache = build_random_cache(model, bsz=bsz, kv_len=kv_len, device=device)
+    verifier_hidden_states = torch.randn(
+        bsz,
         tree_size,
         model.config.hidden_size,
         device=device,
@@ -131,7 +91,7 @@ def benchmark_case(
 
     for _ in range(n_warmup):
         model(
-            hidden_states=draft_hidden_states,
+            inputs_embeds=verifier_hidden_states,
             position_ids=position_ids,
             past_key_values=cache,
             use_cache=True,
@@ -144,7 +104,7 @@ def benchmark_case(
         synchronize(device)
         start = time.perf_counter()
         model(
-            hidden_states=draft_hidden_states,
+            inputs_embeds=verifier_hidden_states,
             position_ids=position_ids,
             past_key_values=cache,
             use_cache=True,
@@ -154,13 +114,12 @@ def benchmark_case(
         cache.crop(kv_len)
 
     result = {
-        "n_layers": n_layers,
         "tree_size": tree_size,
         "kv_len": kv_len,
-        "draft_time_ms": sum(timings_ms) / len(timings_ms),
-        "draft_time_std_ms": pd.Series(timings_ms).std(ddof=0),
+        "bsz": bsz,
+        "verifiertime_ms": sum(timings_ms) / len(timings_ms),
+        "verifiertime_std_ms": pd.Series(timings_ms).std(ddof=0),
         "attn_implementation": model.config._attn_implementation,
-        "hidden_size": hidden_size,
     }
 
     del cache
@@ -184,21 +143,32 @@ def main() -> None:
     torch.cuda.manual_seed_all(0)
 
     results = []
-    for n_layers in N_LAYERS:
-        for hidden_size in HIDDEN_SIZES:
+    for model_name in MODELS:
+        model = Qwen3ForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=DTYPE,
+            attn_implementation="flex_attention"
+        ).to(device)
+        model.eval()
+        for bsz in BSZ:
             for tree_size in TREE_SIZE:
                 for kv_len in KV_LEN:
                     result = benchmark_case(
-                        n_layers=n_layers,
-                        hidden_size=hidden_size,
+                        model=model,
+                        bsz=bsz,
                         tree_size=tree_size,
                         kv_len=kv_len,
                         n_warmup=args.n_warmup,
                         n_test=args.n_test,
                         device=device,
                     )
+                    result["model_name"] = model_name
+                    result["bsz"] = bsz
                     print(result)
-                results.append(result)
+                    results.append(result)
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     df = pd.DataFrame(results)
     print("\nResults:")
