@@ -74,16 +74,13 @@ class BlockTree(TreeProcessor):
         if self.random_embds:
             torch.nn.init.trunc_normal_(noise_embds[:, :, 1:, :])
         sequence_position_ids = torch.arange(self.block_size, device=input_ids.device)[None, None, :] + anchors[:, :, None]
-        tree_position_ids = torch.arange(self.block_size, device=input_ids.device)[
-            None, None, :
-        ].expand(B, N_B, -1)
         tree_labels = torch.gather(input_ids, 1, sequence_position_ids.view(B, N_B * self.block_size)).view(B, N_B, self.block_size)
 
         return TrainingExtras(
             tree_labels=tree_labels,
             noise_embds=noise_embds,
             sequence_position_ids=sequence_position_ids,
-            tree_position_ids=tree_position_ids,
+            tree_position_ids=None,
             target_hidden_states=target_hidden_states,
             tree_masks=self.tree_mask[None, None, :, :].expand(B, N_B, -1, -1),
         )
