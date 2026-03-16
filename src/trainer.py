@@ -200,7 +200,7 @@ class Trainer:
             global_step=self.global_step,
             config=self.config,
         )
-        self.fabric.load(checkpoint_path, state)
+        self.fabric.load(checkpoint_path, state, weights_only=False)
 
     @torch.inference_mode()
     def validate(self):
@@ -512,6 +512,7 @@ class Trainer:
                 drafter_preds,
                 inference_extras.sequence_position_ids,
             )
+            print("Candidates:", self.tokenizer.decode(candidate_extras.input_ids[0]).replace("\n", "\\n"))
             if self.config.verbose:
                 print("--")
                 print("Verifier Inputs:")
@@ -574,7 +575,7 @@ class Trainer:
             )
             output_ids[:, curr_pos + acceptance_length] = verifier_preds[:, best_vertex]
             accepted_ids.append(
-                output_ids[0, curr_pos : curr_pos + acceptance_length].tolist()
+                output_ids[0, curr_pos+1 : curr_pos + acceptance_length].tolist()
             )
             extra_ids.append(output_ids[0, curr_pos + acceptance_length].item())
             curr_pos += acceptance_length
@@ -660,6 +661,7 @@ def build_parser() -> ArgumentParser:
     parser.add_argument('--tree_type', type=str, default="fixed", help="Type of tree structure to use")
     parser.add_argument('--tree_args', type=dict[str, Any], default={}, help="Arguments for tree processor")
     parser.add_argument("--only-spec-dec", action="store_true", help="Only run speculative decoding without training or validation")
+    parser.add_argument("--continue_from_checkpoint", type=str, default=None, help="Path to checkpoint to continue training from")
     return parser
 
 
@@ -689,6 +691,8 @@ def main() -> Trainer:
         tree_type=args.tree_type,
         tree_args=args.tree_args,
     )
+    if args.continue_from_checkpoint:
+        trainer.load_checkpoint(args.continue_from_checkpoint)
     if args.only_spec_dec:
         trainer.validate_quality()
     else:

@@ -4,12 +4,13 @@ import torch.nn.functional as F
 from . import TreeProcessor, CandidateExtras, InferenceExtras, TrainingExtras
 
 class BlockTree(TreeProcessor):
-    def __init__(self, block_size: int, mask_token_id: int, device: torch.device):
+    def __init__(self, block_size: int, mask_token_id: int, device: torch.device, random_embds=False):
         super().__init__()
         self.block_size = block_size
         self.MASK_TOKEN_ID = mask_token_id
         self.tree_mask = torch.tril(torch.ones((block_size, block_size), dtype=torch.bool, device=device))
         self.parent_idx = torch.arange(block_size, device=device) - 1
+        self.random_embds = random_embds
 
     def construct_candidate_extras(self, drafted_ids, sequence_position_ids):
         return CandidateExtras(
@@ -21,15 +22,19 @@ class BlockTree(TreeProcessor):
     
     def construct_inference_extras(self, input_ids, target):
         # input_ids has length curr_pos + 1
-        return InferenceExtras(
-            tree_masks=self.tree_mask[None, None, :],
-            tree_position_ids=None,
-            noise_embds=target.get_input_embeddings()(
+        noise_embds = target.get_input_embeddings()(
                 torch.tensor(
                     [[input_ids[0, -1], *[self.MASK_TOKEN_ID] * (self.block_size - 1)]],
                     device=input_ids.device,
                 )
-            ).view(1, 1, self.block_size, -1),
+            ).view(1, 1, self.block_size, -1)
+        if self.random_embds:
+            torch.nn.init.trunc_normal_(noise_embds[:, :, 1:, :])
+
+        return InferenceExtras(
+            tree_masks=self.tree_mask[None, None, :],
+            tree_position_ids=None,
+            noise_embds=noise_embds,
             sequence_position_ids=torch.arange(self.block_size, device=input_ids.device)[None, None, :] + input_ids.shape[1] - 1,
         )
 
@@ -65,7 +70,9 @@ class BlockTree(TreeProcessor):
             (0, self.block_size - 1),
             value=self.MASK_TOKEN_ID,
         )
-        noise_embds = target.get_input_embeddings()(noise_input_ids)
+        noise_embds = target.get_input_embeddings()(noise_input_ids) # [B, N_B, B_S, D]
+        if self.random_embds:
+            torch.nn.init.trunc_normal_(noise_embds[:, :, 1:, :])
         sequence_position_ids = torch.arange(self.block_size, device=input_ids.device)[None, None, :] + anchors[:, :, None]
         tree_position_ids = torch.arange(self.block_size, device=input_ids.device)[
             None, None, :

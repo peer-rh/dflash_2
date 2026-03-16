@@ -133,8 +133,7 @@ class FixedTreeProcessor(TreeProcessor):
         return InferenceExtras(
             tree_masks=self.full_tree_mask[None, None, :, :].expand(1, 1, -1, -1),
             sequence_position_ids=self.seq_positions[None, None, :].expand(1, 1, -1)
-            + input_ids.shape[1],
-            # TODO: Make this be the actual hidden states
+            + input_ids.shape[1] - 1,
             noise_embds=target.get_input_embeddings()(
                 torch.tensor(
                     [[input_ids[0, -1], *[self.MASK_TOKEN_ID] * (self.tree_size - 1)]],
