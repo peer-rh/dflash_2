@@ -70,3 +70,9 @@ class TreeProcessor:
             parents_idx: [1, T']
         """
         ...
+
+    def get_parent_idx(self):
+        """
+        Returns: [T]
+        """
+        return self.parent_idx
