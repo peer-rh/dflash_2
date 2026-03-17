@@ -247,7 +247,7 @@ class Trainer:
                         input_ids=input_ids, max_length=2048
                     )
 
-                    info["acceptance_lengths"].extend([len(x) for x in outputs.accepted_ids])
+                    info["acceptance_lengths"].extend([len(x) + 1 for x in outputs.accepted_ids])
                     info["tps"].append(outputs.tps)
                     info["tps_with_prefill"].append(outputs.tps_with_prefill)
                     tps_count += 1
