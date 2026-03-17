@@ -9,16 +9,18 @@ from . import TreeProcessor, CandidateExtras, InferenceExtras, TrainingExtras
 from ..util import get_mask_mod_w_offset
 
 
-class FixedTreeProcessor(TreeProcessor):
+class PrunableTreeProcessor(TreeProcessor):
     def __init__(
         self,
         paths: Sequence[Sequence[int]],
         top_k: Sequence[int],
         left_most_idx: int,
+        n_candidate_tokens: int,
         mask_token_id: int,
         device: torch.device,
     ) -> None:
         super().__init__()
+        self.n_candidate_tokens = n_candidate_tokens
         left_most_path = paths[left_most_idx]
         distances_from_left_most = []
         left_most_ancestors = []
@@ -121,12 +123,14 @@ class FixedTreeProcessor(TreeProcessor):
             tree_masks=self.full_tree_mask[None, None, :, :].expand(B, N_T, -1, -1),
         )
 
-    def construct_candidate_extras(self, drafted_ids: torch.Tensor, inference_extras: InferenceExtras, q_values: torch.Tensor) -> CandidateExtras:        
+    def construct_candidate_extras(self, drafted_ids: torch.Tensor, inference_extras: InferenceExtras, q_values: torch.Tensor) -> CandidateExtras:
+        cumulative_prob = (q_values[:, 0, None, :] * self.full_tree_mask[None, :, :] + ~self.full_tree_mask[None, :, :]).prod(dim=-1)
+        candidate_idxs = cumulative_prob.topk(k=self.n_candidate_tokens, dim=-1).indices
         return CandidateExtras(
-            input_ids=drafted_ids[:, 0],
-            sequence_position_ids=inference_extras.sequence_position_ids[:, 0],
-            tree_masks=self.full_tree_mask[None, :],
-            parents_idx=self.parent_idx[None, :],
+            input_ids=drafted_ids[:, 0, candidate_idxs],
+            sequence_position_ids=inference_extras.sequence_position_ids[:, 0, candidate_idxs],
+            tree_masks=self.full_tree_mask[None, :, candidate_idxs][:, candidate_idxs],
+            parents_idx=self.parent_idx[None, candidate_idxs],
         )
 
     def construct_inference_extras(self, input_ids, target):

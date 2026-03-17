@@ -12,7 +12,7 @@ class BlockTree(TreeProcessor):
         self.parent_idx = torch.arange(block_size, device=device) - 1
         self.random_embds = random_embds
 
-    def construct_candidate_extras(self, drafted_ids, sequence_position_ids):
+    def construct_candidate_extras(self, drafted_ids, sequence_position_ids, q_values):
         return CandidateExtras(
             input_ids=drafted_ids[:, 0],
             sequence_position_ids=sequence_position_ids[:, 0],

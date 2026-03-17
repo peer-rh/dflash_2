@@ -26,8 +26,9 @@ class InferenceExtras:
     tree_position_ids: Optional[torch.Tensor] # [1, N_T, T]
 
 class TreeProcessor:
+    parent_idx: torch.Tensor
     def __init__(self):
-        ...
+        pass
 
     def construct_training_extras(self, input_ids, anchors, document_mask, position_ids, target) -> TrainingExtras:
         """
@@ -39,9 +40,11 @@ class TreeProcessor:
             target: Model
         Returns:
             tree_labels: [B, N_T, T]
-            noise_embds: [B, N_T, T, D]
+            noise_embds: [B, N_T, T, D] 
             sequence_position_ids: [B, N_T, T]
             tree_position_ids: [B, N_T, T]
+            TODO: target_tree_probs: [B, N_T, T] # Probability of a random walk getting to this node using the verifier_probs
+            TODO: tree_masks: [B, N_T, T, T] # Attention mask for each tree
         """
         ...
     
@@ -58,16 +61,18 @@ class TreeProcessor:
         """
         ...
     
-    def construct_candidate_extras(self, drafted_ids, sequence_position_ids) -> CandidateExtras:
+    def construct_candidate_extras(self, drafted_ids: torch.Tensor, inference_extras: InferenceExtras, q_values: torch.Tensor | None) -> CandidateExtras:
         """
         Inputs:
             drafted_ids: [1, N_T, T]
-            sequence_position_ids: [1, N_T, T]
+            inference_extras: InferenceExtras
+            q_values: [1, N_T, T]
         Returns:
             input_ids: [1, T']
             sequence_position_ids: [1, T']
             tree_masks: [1, T', T']
             parents_idx: [1, T']
+            TODO: probabilities: [1, T'] # For more optimal speculative decoding
         """
         ...
 
