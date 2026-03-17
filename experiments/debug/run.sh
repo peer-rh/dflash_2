@@ -101,4 +101,4 @@ uv run -m src.trainer --run_name $EXPERIMENT_NAME --seed 42 --trainer.compile tr
     --data.num_workers 4 --trainer.checkpoint_path $checkpoint_path \
     --trainer.grad_accum_steps 3 --trainer.log_every 10 --trainer.num_epochs 8  --trainer.eval_every 2048 --trainer.save_every 2048 \
     --tree_type fixed --tree_args "$TREE_JSON" --trainer.ddp false --trainer.precision 'bf16-true' \
-    --continue_from_checkpoint experiments/tree-dev-compile/outputs/checkpoints/checkpoint_20480.ckpt --only-spec-dec
+    --continue_from_checkpoint experiments/tree-dev-compile/outputs/checkpoints/checkpoint_22528.ckpt --only-spec-dec
