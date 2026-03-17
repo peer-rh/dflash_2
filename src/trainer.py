@@ -24,6 +24,7 @@ from lightning.fabric.utilities import AttributeDict
 from .trees import TreeProcessor
 from .trees.fixed_tree import FixedTreeProcessor
 from .trees.block_tree import BlockTree
+from .trees.fixed_tree_prunable import PrunableTreeProcessor
 from .util import SpecializedDynamicCache, merge_metrics, sample, wall_time
 from .data.data_module import DataModule, DataModuleConfig
 from .models.dflash import DFlashDraftModel
@@ -57,7 +58,7 @@ class Trainer:
         logger: WandbLogger,
         data: DataModuleConfig,
         drafter: dict[str, Any] | str,
-        tree_type: Literal["fixed"] = "fixed",
+        tree_type: Literal["fixed", "prunable", "block"] = "fixed",
         tree_args: dict[str, Any] | None = None,
     ):
         self.config = config
@@ -134,6 +135,8 @@ class Trainer:
 
         if tree_type == "fixed":
             self.tree_processor = FixedTreeProcessor(**tree_args, mask_token_id=self.mask_token_id, device=self.fabric.device)
+        elif tree_type == "prunable":
+            self.tree_processor = PrunableTreeProcessor(**tree_args, mask_token_id=self.mask_token_id, device=self.fabric.device)
         elif tree_type == "block":
             self.tree_processor = BlockTree(**tree_args, mask_token_id=self.mask_token_id, device=self.fabric.device)
         else:
@@ -430,12 +433,18 @@ class Trainer:
         }
         loss = lm_loss
         if self.drafter.config.use_q_head:
-            q_values = self.drafter.q_head(tree_hs).view(B, N_T, T, -1)
-            q_loss = F.binary_cross_entropy_with_logits(q_values[:, :, 1:, 0].view(-1), is_correct.view(-1).float(), reduction="sum")
+            q_values = self.drafter.q_head(tree_hs.view(B, N_T, T, -1)[:, :, 1:].to(self.drafter.q_head.weight.dtype))[:, :, :, 0]
+            q_loss = F.binary_cross_entropy_with_logits(q_values.view(-1), is_correct.view(-1).float(), reduction="sum")
             loss = lm_loss + 0.5 * q_loss
             metrics["q_loss_sum"] = q_loss.detach()
-            metrics["q_accuracy_count"] = ((q_values[:, :, 1:, 0] > 0) == is_correct).sum().detach()
-        
+            metrics["q_accuracy_count"] = ((q_values > 0) == is_correct).sum().detach()
+            if self.config.verbose:
+                print(is_correct.shape, q_values.shape)
+                print('--')
+                print("Q-Head Info:")
+                print("Q Values:", q_values[0, 0])
+                print("Q Accuracy:", ((q_values > 0) == is_correct).sum(dim=-1)[0, 0])
+
         return loss / (B * N_T * T), metrics
 
     def _train_inner(self, batch):
@@ -540,7 +549,7 @@ class Trainer:
             drafter_logits = self.lm_head(drafter_out)  # [1, N_T * T, V]
             q_values = None
             if self.drafter.config.use_q_head:
-                q_values = torch.sigmoid(self.drafter.q_head(drafter_out).view(1, N_T, T))
+                q_values = torch.sigmoid(self.drafter.q_head(drafter_out.to(self.drafter.q_head.weight.dtype)).view(1, N_T, T))
                 q_values[:, :, 0] = 1.0
             drafter_preds = sample(drafter_logits, 0.0).view(1, N_T, T)  # [1, N_T, T]
             drafter_preds[:, :, 0] = output_ids[0, curr_pos]
@@ -561,7 +570,7 @@ class Trainer:
                 q_values=q_values,
             )
 
-            print("Candidates:", self.tokenizer.decode(candidate_extras.input_ids[0]).replace("\n", "\\n"))
+            # print("Candidates:", self.tokenizer.decode(candidate_extras.input_ids[0]).replace("\n", "\\n"))
             if self.config.verbose:
                 print("--")
                 print("Verifier Inputs:")
@@ -627,7 +636,7 @@ class Trainer:
                 output_ids[0, curr_pos+1 : curr_pos + acceptance_length].tolist()
             )
             extra_ids.append(output_ids[0, curr_pos + acceptance_length].item()) # type: ignore
-            curr_pos += acceptance_length
+            curr_pos += int(acceptance_length)
             if self.config.verbose:
                 print("--")
                 print("Acceptance Info:")
@@ -758,6 +767,7 @@ def main():
 
 
 if __name__ == "__main__":
+    torch.compiler.reset()
     torch._dynamo.config.cache_size_limit = 64
     torch._dynamo.config.allow_unspec_int_on_nn_module = True
     torch.set_float32_matmul_precision('medium')

@@ -124,13 +124,38 @@ class PrunableTreeProcessor(TreeProcessor):
         )
 
     def construct_candidate_extras(self, drafted_ids: torch.Tensor, inference_extras: InferenceExtras, q_values: torch.Tensor) -> CandidateExtras:
-        cumulative_prob = (q_values[:, 0, None, :] * self.full_tree_mask[None, :, :] + ~self.full_tree_mask[None, :, :]).prod(dim=-1)
+        assert drafted_ids.shape[1] == 1, "Drafted ids should have n_blocks of 1"
+        cumulative_prob = torch.where(
+            self.full_tree_mask,
+            q_values[0, 0, None, :],
+            1.0,
+        ).prod(dim=-1)
         candidate_idxs = cumulative_prob.topk(k=self.n_candidate_tokens, dim=-1).indices
+        # Original parent indices for the selected candidates
+        selected_parents = self.parent_idx[candidate_idxs]
+
+        # Build mapping: old tree index -> new compacted index
+        old_to_new = torch.full(
+            (self.parent_idx.shape[0],),
+            -1,
+            dtype=candidate_idxs.dtype,
+            device=candidate_idxs.device,
+        )
+        old_to_new[candidate_idxs] = torch.arange(
+            candidate_idxs.shape[0],
+            device=candidate_idxs.device,
+            dtype=candidate_idxs.dtype,
+        )
+
+        # Remap parents into the new compact index space
+        remapped_parents = old_to_new[selected_parents]
+        remapped_parents[selected_parents == -1] = -1
         return CandidateExtras(
             input_ids=drafted_ids[:, 0, candidate_idxs],
             sequence_position_ids=inference_extras.sequence_position_ids[:, 0, candidate_idxs],
             tree_masks=self.full_tree_mask[None, :, candidate_idxs][:, candidate_idxs],
-            parents_idx=self.parent_idx[None, candidate_idxs],
+            parents_idx=remapped_parents[None, :],
+
         )
 
     def construct_inference_extras(self, input_ids, target):

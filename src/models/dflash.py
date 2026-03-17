@@ -175,6 +175,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         if self.config.use_tree_pos_emb:
             self.tree_pos_embd = nn.Embedding(config.max_tree_size, config.hidden_size)
         
+        self.q_head = None
         if not hasattr(config, "use_q_head"):
             self.config.use_q_head = False
         if self.config.use_q_head:
