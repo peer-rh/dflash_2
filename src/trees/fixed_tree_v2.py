@@ -125,10 +125,10 @@ class FixedTreeProcessor(TreeProcessor):
             tree_masks=self.full_tree_mask[None, None, :, :].expand(B, N_T, -1, -1),
         )
 
-    def construct_candidate_extras(self, drafted_ids, sequence_position_ids):
+    def construct_candidate_extras(self, drafted_ids: torch.Tensor, inference_extras: InferenceExtras, q_values: torch.Tensor) -> CandidateExtras:
         return CandidateExtras(
             input_ids=drafted_ids[:, 0],
-            sequence_position_ids=sequence_position_ids[:, 0],
+            sequence_position_ids=inference_extras.sequence_position_ids[:, 0],
             tree_masks=self.full_tree_mask[None, :],
             parents_idx=self.parent[None, :],
         )

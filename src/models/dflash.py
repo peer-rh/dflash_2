@@ -175,6 +175,11 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         if self.config.use_tree_pos_emb:
             self.tree_pos_embd = nn.Embedding(config.max_tree_size, config.hidden_size)
         
+        if not hasattr(config, "use_q_head"):
+            self.config.use_q_head = False
+        if self.config.use_q_head:
+            self.q_head = nn.Linear(config.hidden_size, 1, bias=False)
+        
         self.post_init()
 
     def extract_ctx_features(self, hidden_states: list[torch.Tensor]) -> torch.Tensor:
@@ -201,7 +206,6 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             tree_position_embeddings = self.tree_pos_embd(tree_position_ids)
             hidden_states = hidden_states + tree_position_embeddings
 
-        
         for layer in self.layers:
             hidden_states = layer(
                 hidden_states=hidden_states,

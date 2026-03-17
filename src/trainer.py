@@ -385,7 +385,7 @@ class Trainer:
         )
         tree_logits = self.lm_head(tree_hs).view(B, N_T, T, -1)
 
-        loss = F.cross_entropy(
+        lm_loss = F.cross_entropy(
             tree_logits.view(-1, tree_logits.size(-1)), tree_labels.view(-1), reduction="sum"
         )
         if self.config.verbose:
@@ -396,39 +396,46 @@ class Trainer:
                 print(self.tokenizer.decode(tree_labels[0, 0, tree_extras.tree_masks[0, 0, i].bool()]))
 
             print("Tree Preds:", self.tokenizer.decode(tree_logits.argmax(dim=-1)[0, 0]))
-            print("Loss:", loss.item())
+            print("Loss:", lm_loss.item())
+        with torch.no_grad():
+            pred_ids = tree_logits.argmax(dim=-1)
+            is_correct = pred_ids[:, :, 1:] == tree_labels[:, :, 1:] # [B, N_T, T-1]
 
-        pred_ids = tree_logits.argmax(dim=-1)
-        is_correct = pred_ids[:, :, 1:] == tree_labels[:, :, 1:]
+            target_labels_aligned = input_ids.gather(1, 
+                tree_extras.sequence_position_ids[:, :, 1:].reshape(B, N_T * (T - 1))
+            ).view(B, N_T, T - 1)
+            depth = tree_extras.sequence_position_ids[:, :, 1:] - anchors[:, :, None] # [B, N_T, T-1]
+            is_accepted = target_labels_aligned == pred_ids[:, :, 1:] # [B, N_T, T-1]
+            is_accepted = (
+                is_accepted[:, :, None, :] & tree_extras.tree_masks[:, :, 1:, 1:]
+            ).sum(dim=-1) == depth # [B, N_T, T-1]
+            best = (is_accepted * depth).max(dim=-1)
+            acceptance_length = best.values + 1
+            if self.config.verbose:
+                print('--')
+                print("Acceptance Info:")
+                print("Target Labels Aligned:", self.tokenizer.decode(target_labels_aligned[0, 0]))
+                print("Is Correct:", is_correct[0, 0])
+                print("Is Accepted:", is_accepted[0, 0])
+                print("Best:", best.values[0, 0])
+                print("Acceptance Length:", acceptance_length[0,0])
 
-        target_labels_aligned = input_ids.gather(1, 
-            tree_extras.sequence_position_ids[:, :, 1:].reshape(B, N_T * (T - 1))
-        ).view(B, N_T, T - 1)
-        depth = tree_extras.sequence_position_ids[:, :, 1:] - anchors[:, :, None] # [B, N_T, T-1]
-        is_accepted = target_labels_aligned == pred_ids[:, :, 1:] # [B, N_T, T-1]
-        is_accepted = (
-            is_accepted[:, :, None, :] & tree_extras.tree_masks[:, :, 1:, 1:]
-        ).sum(dim=-1) == depth # [B, N_T, T-1]
-        best = (is_accepted * depth).max(dim=-1)
-        acceptance_length = best.values + 1
-        if self.config.verbose:
-            print('--')
-            print("Acceptance Info:")
-            print("Target Labels Aligned:", self.tokenizer.decode(target_labels_aligned[0, 0]))
-            print("Is Correct:", is_correct[0, 0])
-            print("Is Accepted:", is_accepted[0, 0])
-            print("Best:", best.values[0, 0])
-            print("Acceptance Length:", acceptance_length[0,0])
-
-        
         metrics = {
-            "lm_loss_sum": loss.detach(),
+            "lm_loss_sum": lm_loss.detach(),
             "batch_count": B,
             "block_count": B * N_T,
             "token_count": B * N_T * T,
             "token_correct_count": is_correct.sum().detach(),
             "accepted_length_sum": acceptance_length.sum().detach(),
         }
+        loss = lm_loss
+        if self.drafter.config.use_q_head:
+            q_values = self.drafter.q_head(tree_hs).view(B, N_T, T, -1)
+            q_loss = F.binary_cross_entropy_with_logits(q_values[:, :, 1:, 0].view(-1), is_correct.view(-1).float(), reduction="sum")
+            loss = lm_loss + 0.5 * q_loss
+            metrics["q_loss_sum"] = q_loss.detach()
+            metrics["q_accuracy_count"] = ((q_values[:, :, 1:, 0] > 0) == is_correct).sum().detach()
+        
         return loss / (B * N_T * T), metrics
 
     def _train_inner(self, batch):
@@ -531,6 +538,10 @@ class Trainer:
                 use_cache=True,
             )
             drafter_logits = self.lm_head(drafter_out)  # [1, N_T * T, V]
+            q_values = None
+            if self.drafter.config.use_q_head:
+                q_values = torch.sigmoid(self.drafter.q_head(drafter_out).view(1, N_T, T))
+                q_values[:, :, 0] = 1.0
             drafter_preds = sample(drafter_logits, 0.0).view(1, N_T, T)  # [1, N_T, T]
             drafter_preds[:, :, 0] = output_ids[0, curr_pos]
             past_key_values_drafter.crop(curr_pos)  # Discard drafted tokens from cache
@@ -545,8 +556,9 @@ class Trainer:
             step_count += 1
 
             candidate_extras = self.tree_processor.construct_candidate_extras(
-                drafter_preds,
-                inference_extras.sequence_position_ids,
+                drafted_ids=drafter_preds,
+                inference_extras=inference_extras,
+                q_values=q_values,
             )
 
             print("Candidates:", self.tokenizer.decode(candidate_extras.input_ids[0]).replace("\n", "\\n"))
@@ -610,11 +622,11 @@ class Trainer:
             output_ids[:, curr_pos : curr_pos + acceptance_length] = (
                 candidate_extras.input_ids[:, acceptance_mask]
             )
-            output_ids[:, curr_pos + acceptance_length] = verifier_preds[:, best_vertex]
+            output_ids[:, curr_pos + acceptance_length] = verifier_preds[:, best_vertex] # type: ignore
             accepted_ids.append(
                 output_ids[0, curr_pos+1 : curr_pos + acceptance_length].tolist()
             )
-            extra_ids.append(output_ids[0, curr_pos + acceptance_length].item())
+            extra_ids.append(output_ids[0, curr_pos + acceptance_length].item()) # type: ignore
             curr_pos += acceptance_length
             if self.config.verbose:
                 print("--")
@@ -632,7 +644,7 @@ class Trainer:
                 break
 
 
-        same_token_heatmap = same_token_heatmap / step_count
+        same_token_heatmap = same_token_heatmap / step_count # type: ignore
         parent_idx = self.tree_processor.get_parent_idx()
         same_sibling = same_token_heatmap * (parent_idx[:, None] == parent_idx[None, :])
         done_time = wall_time()
@@ -664,6 +676,9 @@ class Trainer:
         #     if k.startswith("pos_wise_correct_count"):
         #         identifier = k.split("/")[1]
         #         metrics[f"accuracy/{identifier}"] = v / reduced_metrics[f'pos_wise_token_count/{identifier}']
+        if 'q_loss_sum' in reduced_metrics:
+            metrics["q_loss"] = reduced_metrics['q_loss_sum'] / reduced_metrics['token_count']
+            metrics["q_accuracy"] = reduced_metrics['q_accuracy_count'] / reduced_metrics['token_count']
         
         if prefix:
             metrics = {f"{prefix}/{k}": v for k, v in metrics.items()}
