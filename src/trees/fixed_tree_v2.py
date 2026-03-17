@@ -13,13 +13,17 @@ class FixedTreeProcessor(TreeProcessor):
     def __init__(
         self,
         paths: Sequence[Sequence[int]],
-        top_k: Sequence[int],
-        left_most_idx: int,
+        ignore_threshold: float | None,
         mask_token_id: int,
         device: torch.device,
     ) -> None:
         super().__init__()
-        left_most_path = paths[left_most_idx]
+        # The idea is the following:
+        # For a block at each position we create a divergent tree of the shape as defined by paths
+        # - Path (0,0,1) means 'top-0', 'top-0', 'top-1' sampling
+        # Ignore threshold means, 'don't' have this token if the target assigns this token a p < ignore_threshold
+
+
         distances_from_left_most = []
         left_most_ancestors = []
         for path in paths:
@@ -56,7 +60,7 @@ class FixedTreeProcessor(TreeProcessor):
         self.MASK_TOKEN_ID = mask_token_id
 
         self.tree_size = len(self.paths)
-        self.parent_idx = torch.tensor(
+        self.parent = torch.tensor(
             [path[-2] if len(path) > 1 else -1 for path in self.paths],
             dtype=torch.long,
             device=device,
@@ -75,7 +79,7 @@ class FixedTreeProcessor(TreeProcessor):
             self.seq_positions[vertex_idx] = len(ancestor_path)
             if len(ancestor_path) > 0:
                 parent_idx = ancestor_path[-1]
-                self.parent_idx[vertex_idx] = parent_idx
+                self.parent[vertex_idx] = parent_idx
                 self.is_leaf[parent_idx] = False
                 for ancestor_idx in ancestor_path:
                     self.full_tree_mask[vertex_idx, ancestor_idx] = True
@@ -126,7 +130,7 @@ class FixedTreeProcessor(TreeProcessor):
             input_ids=drafted_ids[:, 0],
             sequence_position_ids=sequence_position_ids[:, 0],
             tree_masks=self.full_tree_mask[None, :],
-            parents_idx=self.parent_idx[None, :],
+            parents_idx=self.parent[None, :],
         )
 
     def construct_inference_extras(self, input_ids, target):
@@ -194,7 +198,7 @@ class FixedTreeProcessor(TreeProcessor):
         )
         for i in left_most_indexes:
             tree_labels[:, :, i] = torch.gather(input_ids, 1, anchors + i)
-            is_child = self.parent_idx == i
+            is_child = self.parent == i
             this_logits = torch.gather(
                 logits, 1, i + anchors[:, :, None].expand(-1, -1, logits.shape[-1])
             )  # [B, N_B, vocab_size]
@@ -277,7 +281,7 @@ class FixedTreeProcessor(TreeProcessor):
             )
             # is_any_child = (self.parent[None, :] == next_input_idx[:, None]).any(dim=0)
             for i, par in enumerate(next_input_idx):
-                children = self.parent_idx == par
+                children = self.parent == par
                 tree_labels[:, :, children] = this_logits_topk[
                     :, :, i, self.top_k[children]
                 ]

@@ -11,6 +11,7 @@ import time
 
 from jsonargparse import ActionConfigFile, ArgumentParser
 import jsonargparse
+from matplotlib import pyplot as plt
 import torch
 import torch.nn.functional as F
 from lightning import Fabric, seed_everything
@@ -224,6 +225,8 @@ class Trainer:
                 "acceptance_lengths": [],
                 "tps": [],
                 "tps_with_prefill": [],
+                "same_token_heatmap": [],
+                "same_sibling_heatmap": [],
             }
             text = ""
             tps_count = 0
@@ -250,6 +253,8 @@ class Trainer:
                     info["acceptance_lengths"].extend([len(x) for x in outputs.accepted_ids])
                     info["tps"].append(outputs.tps)
                     info["tps_with_prefill"].append(outputs.tps_with_prefill)
+                    info["same_token_heatmap"].append(outputs.same_token_heatmap)
+                    info["same_sibling_heatmap"].append(outputs.same_sibling_heatmap)
                     tps_count += 1
 
                     output_text = self.tokenizer.decode(
@@ -278,18 +283,43 @@ class Trainer:
             metrics_reduced = self.fabric.all_reduce(metrics, reduce_op="mean")
             if self.fabric.is_global_zero:
                 # Histogram + examples only for rank 0; else we aggregate over all gpus
+                import numpy as np
+                import matplotlib.pyplot as plt
+                
+                # Compute average heatmaps
+                avg_same_token_heatmap = np.mean(info["same_token_heatmap"], axis=0)
+                avg_same_sibling_heatmap = np.mean(info["same_sibling_heatmap"], axis=0)
+                fig_sibling = self._make_heatplot(avg_same_sibling_heatmap, 'Average Same Sibling Heatmap')
+                fig_token = self._make_heatplot(avg_same_token_heatmap, 'Average Same Token Heatmap')
+                
                 self.wandb.experiment.log(
-                {
-                    f"{split_name}/acceptance_length_histogram": wandb.Histogram(
-                        info["acceptance_lengths"]
-                    ),
-                    f"{split_name}/examples": wandb.Html(text),
-                    f"{split_name}/throughput": metrics_reduced["tps_mean"], # type: ignore
-                    f"{split_name}/throughput_with_prefill": metrics_reduced["tps_with_prefill_mean"], # type: ignore
-                    f"{split_name}/acceptance_length": metrics_reduced["acceptance_length_mean"], # type: ignore
-                },
-                step=self.global_step,
-            )
+                    {
+                        f"{split_name}/acceptance_length_histogram": wandb.Histogram(
+                            info["acceptance_lengths"]
+                        ),
+                        f"{split_name}/same_token_heatmap": wandb.Image(fig_token),
+                        f"{split_name}/same_sibling_heatmap": wandb.Image(fig_sibling),
+                        f"{split_name}/examples": wandb.Html(text),
+                        f"{split_name}/throughput": metrics_reduced["tps_mean"], # type: ignore
+                        f"{split_name}/throughput_with_prefill": metrics_reduced["tps_with_prefill_mean"], # type: ignore
+                        f"{split_name}/acceptance_length": metrics_reduced["acceptance_length_mean"], # type: ignore
+                    },
+                    step=self.global_step,
+                )
+                plt.close(fig_token)
+                plt.close(fig_sibling)
+
+    def _make_heatplot(self, heatmap, title):
+        fig_sibling, ax_sibling = plt.subplots(figsize=(10, 8))
+        im_sibling = ax_sibling.imshow(heatmap, cmap='viridis')
+        for i in range(heatmap.shape[0]):
+            for j in range(heatmap.shape[1]):
+                ax_sibling.text(j, i, f'{heatmap[i, j]:.2f}', 
+                                ha='center', va='center', color='white', fontsize=8)
+        ax_sibling.set_title(title)
+        plt.colorbar(im_sibling, ax=ax_sibling)
+        plt.tight_layout()
+        return fig_sibling
 
     def process_batch(self, batch):
         input_ids = batch["input_ids"]  # [B, S]
@@ -438,6 +468,8 @@ class Trainer:
         )
         accepted_ids = []
         extra_ids = []
+        same_token_heatmap = None
+        step_count = 0
 
         # Prefill the Ta
         past_key_values_drafter = DynamicCache(config=self.drafter.config)
@@ -508,10 +540,15 @@ class Trainer:
                 print("Preds:", self.tokenizer.decode(drafter_preds[0].flatten()).replace("\n", "\\n"))
                 print("Drafter KV Cache Len: ", past_key_values_drafter.get_seq_length())
 
+            same_token = (drafter_preds[:, :, None, :] == drafter_preds[:, :, :, None]).to(torch.float).sum(dim=1)[0] # [T, T]
+            same_token_heatmap = same_token if same_token_heatmap is None else same_token_heatmap + same_token
+            step_count += 1
+
             candidate_extras = self.tree_processor.construct_candidate_extras(
                 drafter_preds,
                 inference_extras.sequence_position_ids,
             )
+
             print("Candidates:", self.tokenizer.decode(candidate_extras.input_ids[0]).replace("\n", "\\n"))
             if self.config.verbose:
                 print("--")
@@ -595,6 +632,9 @@ class Trainer:
                 break
 
 
+        same_token_heatmap = same_token_heatmap / step_count
+        parent_idx = self.tree_processor.get_parent_idx()
+        same_sibling = same_token_heatmap * (parent_idx[:, None] == parent_idx[None, :])
         done_time = wall_time()
         time_with_prefill = done_time - start_time
         time_without_prefill = done_time - post_prefill_time
@@ -605,6 +645,8 @@ class Trainer:
             extra_ids=extra_ids,
             tps=tokens_generated / time_without_prefill,
             tps_with_prefill=tokens_generated / time_with_prefill,
+            same_token_heatmap=same_token_heatmap.to("cpu").numpy(),
+            same_sibling_heatmap=same_sibling.to("cpu").numpy(),
         )
 
     def log_metrics(self, metrics, prefix=None):
@@ -665,7 +707,7 @@ def build_parser() -> ArgumentParser:
     return parser
 
 
-def main() -> Trainer:
+def main():
     parser = build_parser()
     args = parser.parse_args()
     seed_everything(args.seed)
