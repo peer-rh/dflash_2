@@ -172,6 +172,7 @@ class PrunableTreeProcessor(TreeProcessor):
             tree_position_ids=torch.arange(self.tree_size, device=input_ids.device),
         )
 
+    @torch.compiler.disable()
     def _generate_labels(
         self,
         input_ids,
