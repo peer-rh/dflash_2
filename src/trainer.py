@@ -24,7 +24,7 @@ from lightning.fabric.utilities import AttributeDict
 from .trees import TreeProcessor
 from .trees.fixed_tree import FixedTreeProcessor
 from .trees.block_tree import BlockTree
-from .trees.fixed_tree_prunable import PrunableTreeProcessor
+from .trees.fixed_tree_prunable2 import PrunableTreeProcessor
 from .util import SpecializedDynamicCache, merge_metrics, sample, wall_time
 from .data.data_module import DataModule, DataModuleConfig
 from .models.dflash import DFlashDraftModel
@@ -767,7 +767,6 @@ def main():
 
 
 if __name__ == "__main__":
-    torch.compiler.reset()
     torch._dynamo.config.cache_size_limit = 64
     torch._dynamo.config.allow_unspec_int_on_nn_module = True
     torch.set_float32_matmul_precision('medium')
