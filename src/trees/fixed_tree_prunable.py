@@ -129,8 +129,9 @@ class PrunableTreeProcessor(TreeProcessor):
             self.full_tree_mask,
             q_values[0, 0, None, :],
             1.0,
-        ).prod(dim=-1)
+        ).prod(dim=-1) + torch.arange(self.tree_size, device=q_values.device) * 1e-6
         candidate_idxs = cumulative_prob.topk(k=self.n_candidate_tokens, dim=-1).indices
+        candidate_idxs = candidate_idxs.sort().values
         # Original parent indices for the selected candidates
         selected_parents = self.parent_idx[candidate_idxs]
 
