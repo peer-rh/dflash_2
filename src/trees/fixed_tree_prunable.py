@@ -87,13 +87,12 @@ class PrunableTreeProcessor(TreeProcessor):
             :, ~self.is_leaf & ~self.is_left_most
         ]
         self.no_leaf_no_left_mask = self.attn_tree_mask
-        relation_map = torch.zeros((self.tree_size, self.tree_size), dtype=torch.bool, device=device)
-        relation_map[self.full_tree_mask] = DESCENDANT_RELATION
-        relation_map[self.full_tree_mask.T] = ANCESTOR_RELATION
-        relation_map[self.parent_idx[None, :] == torch.arange(self.tree_size, device=device)[:, None]] = PARENT_RELATION
-        relation_map[self.parent_idx[:, None] == torch.arange(self.tree_size, device=device)[None, :]] = CHILD_RELATION
+        relation_map = torch.zeros((self.tree_size, self.tree_size), dtype=torch.long, device=device)
+        relation_map[self.full_tree_mask] = ANCESTOR_RELATION
+        relation_map[self.full_tree_mask.T] = DESCENDANT_RELATION
+        relation_map[self.parent_idx[:, None] == torch.arange(self.tree_size, device=device)[None, :]] = PARENT_RELATION
+        relation_map[self.parent_idx[None, :] == torch.arange(self.tree_size, device=device)[:, None]] = CHILD_RELATION
         relation_map[torch.arange(self.tree_size, device=device), torch.arange(self.tree_size, device=device)] = IS_SELF_RELATION
-        print("Relation map:\n", relation_map)
         self.tree_info = TreeInfo(
             tree_mask=self.full_tree_mask,
             parent_idx=self.parent_idx,

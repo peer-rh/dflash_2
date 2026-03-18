@@ -17,7 +17,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.cache_utils import Cache
 
-from trees import TreeInfo
+from ..trees import TreeInfo
 from ..util import build_target_layer_ids, extract_context_feature
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
