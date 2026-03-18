@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask
 from transformers.cache_utils import StaticCache
 
-from . import TreeProcessor, CandidateExtras, InferenceExtras, TrainingExtras
+from . import DESCENDANT_RELATION, TreeInfo, TreeProcessor, CandidateExtras, InferenceExtras, TrainingExtras, CHILD_RELATION, ANCESTOR_RELATION, IS_SELF_RELATION, PARENT_RELATION, expand_tree_info
 from ..util import get_mask_mod_w_offset
 
 
@@ -15,12 +15,12 @@ class PrunableTreeProcessor(TreeProcessor):
         paths: Sequence[Sequence[int]],
         top_k: Sequence[int],
         left_most_idx: int,
-        n_candidate_tokens: int,
+        n_candidate_tokens: int | None,
         mask_token_id: int,
         device: torch.device,
     ) -> None:
         super().__init__()
-        self.n_candidate_tokens = n_candidate_tokens
+        self.n_candidate_tokens = n_candidate_tokens 
         left_most_path = paths[left_most_idx]
         distances_from_left_most = []
         left_most_ancestors = []
@@ -87,6 +87,21 @@ class PrunableTreeProcessor(TreeProcessor):
             :, ~self.is_leaf & ~self.is_left_most
         ]
         self.no_leaf_no_left_mask = self.attn_tree_mask
+        relation_map = torch.zeros((self.tree_size, self.tree_size), dtype=torch.bool, device=device)
+        relation_map[self.full_tree_mask] = DESCENDANT_RELATION
+        relation_map[self.full_tree_mask.T] = ANCESTOR_RELATION
+        relation_map[self.parent_idx[None, :] == torch.arange(self.tree_size, device=device)[:, None]] = PARENT_RELATION
+        relation_map[self.parent_idx[:, None] == torch.arange(self.tree_size, device=device)[None, :]] = CHILD_RELATION
+        relation_map[torch.arange(self.tree_size, device=device), torch.arange(self.tree_size, device=device)] = IS_SELF_RELATION
+        print("Relation map:\n", relation_map)
+        self.tree_info = TreeInfo(
+            tree_mask=self.full_tree_mask,
+            parent_idx=self.parent_idx,
+            depth=self.seq_positions,
+            is_leaf=self.is_leaf,
+            relation_map=relation_map,
+            tree_position_ids=torch.arange(self.tree_size, device=device)
+        )
 
     def construct_training_extras(
         self, input_ids, anchors, document_mask, position_ids, target
@@ -110,20 +125,23 @@ class PrunableTreeProcessor(TreeProcessor):
         noise_embds = target.get_input_embeddings()(noise_input_ids)
 
         sequence_position_ids = self.seq_positions[None, None, :] + anchors[:, :, None]
-        tree_position_ids = torch.arange(self.tree_size, device=input_ids.device)[
-            None, None, :
-        ].expand(B, N_T, -1)
 
         return TrainingExtras(
             tree_labels=tree_labels,
             noise_embds=noise_embds,
             sequence_position_ids=sequence_position_ids,
-            tree_position_ids=tree_position_ids,
             target_hidden_states=target_hidden_states,
-            tree_masks=self.full_tree_mask[None, None, :, :].expand(B, N_T, -1, -1),
+            tree_info=expand_tree_info(self.tree_info, (B, N_T)),
         )
 
     def construct_candidate_extras(self, drafted_ids: torch.Tensor, inference_extras: InferenceExtras, q_values: torch.Tensor) -> CandidateExtras:
+        if self.n_candidate_tokens is None:
+            return CandidateExtras(
+                input_ids=drafted_ids[:, 0],
+                sequence_position_ids=inference_extras.sequence_position_ids[:, 0],
+                tree_masks=inference_extras.tree_info.tree_mask[:, 0],
+                parents_idx=inference_extras.tree_info.parent_idx[:, 0],
+            )
         assert drafted_ids.shape[1] == 1, "Drafted ids should have n_blocks of 1"
         cumulative_prob = torch.where(
             self.full_tree_mask,
@@ -161,7 +179,7 @@ class PrunableTreeProcessor(TreeProcessor):
 
     def construct_inference_extras(self, input_ids, target):
         return InferenceExtras(
-            tree_masks=self.full_tree_mask[None, None, :, :].expand(1, 1, -1, -1),
+            tree_info=expand_tree_info(self.tree_info, (1, 1)),
             sequence_position_ids=self.seq_positions[None, None, :].expand(1, 1, -1)
             + input_ids.shape[1] - 1,
             noise_embds=target.get_input_embeddings()(
@@ -170,7 +188,6 @@ class PrunableTreeProcessor(TreeProcessor):
                     device=input_ids.device,
                 )
             ).view(1, 1, self.tree_size, -1),
-            tree_position_ids=torch.arange(self.tree_size, device=input_ids.device),
         )
 
     @torch.compiler.disable()

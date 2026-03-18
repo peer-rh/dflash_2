@@ -16,6 +16,8 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.cache_utils import Cache
+
+from trees import TreeInfo
 from ..util import build_target_layer_ids, extract_context_feature
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
@@ -53,6 +55,10 @@ class Qwen3DFlashAttention(nn.Module):
         self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
+        if not hasattr(config, "use_additive_tree_pos_bias"):
+            config.use_additive_tree_pos_bias = False
+        if config.use_additive_tree_pos_bias:
+            self.tree_pos_bias = nn.Embedding(10, config.num_attention_heads)
 
     def forward(
         self,
@@ -60,11 +66,13 @@ class Qwen3DFlashAttention(nn.Module):
         target_hidden: Optional[torch.Tensor],
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor],
+        tree_info: TreeInfo,
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        noise_len = hidden_states.shape[1]
         bsz, q_len = hidden_states.shape[:-1]
         ctx_len = target_hidden.shape[1] if target_hidden is not None else 0
         q = self.q_proj(hidden_states)
@@ -92,6 +100,24 @@ class Qwen3DFlashAttention(nn.Module):
         attn_fn: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        
+        total_len = k.shape[2]
+        total_ctx_len = total_len - noise_len
+        exitsing_score_mod = kwargs.get("score_mod", lambda s, B, H, Q, KV: s)
+        score_mod = exitsing_score_mod
+        if hasattr(self, "tree_pos_bias"):
+            B, N_B, T, _ = tree_info.relation_map.shape
+            bias = self.tree_pos_bias(tree_info.relation_map).view(B, N_B, T, T, -1) # [B, N_B * T, T, num_heads]
+            def score_mod(score, B, H, Q, KV):
+                KV_TREE = (KV - total_ctx_len) // T
+                Q_TREE = Q // T
+                Q_TREE_POS = Q % T
+                KV_TREE_POS = (KV - total_ctx_len) % T
+                same_tree = (Q_TREE == KV_TREE)
+                is_tree = KV >= total_ctx_len
+                bias_ = bias[B, Q_TREE, Q_TREE_POS, KV_TREE_POS, H] * same_tree * is_tree
+                score = exitsing_score_mod(score + bias_, B, H, Q, KV)
+
         attn_output, attn_weights = attn_fn(
             self,
             q,
@@ -101,6 +127,7 @@ class Qwen3DFlashAttention(nn.Module):
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
             sliding_window=self.sliding_window,
+            score_mod=score_mod,
             **kwargs,
         )
         attn_output = attn_output.reshape(bsz, q_len, -1)
@@ -118,6 +145,7 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
 
     def forward(
         self,
+        tree_info: TreeInfo,
         target_hidden: Optional[torch.Tensor] = None,
         hidden_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -133,6 +161,7 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
+            tree_info=tree_info,
             target_hidden=target_hidden,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -183,7 +212,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         
         self.post_init()
 
-    def extract_ctx_features(self, hidden_states: list[torch.Tensor]) -> torch.Tensor:
+    def extract_ctx_features(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # return extract_context_feature(hidden_states, self.target_layer_ids)
         B, S, N, D = hidden_states.shape
         return hidden_states.view(B,S, N * D)
@@ -191,20 +220,22 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
     def forward(
         self,
         position_ids: torch.LongTensor,
+        tree_info: TreeInfo,  
         attention_mask: Optional[torch.Tensor] = None,
         hidden_states: Optional[torch.Tensor] = None,
         target_ctx_features: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
-        tree_position_ids: Optional[torch.Tensor] = None,  
         **kwargs,
     ) -> CausalLMOutputWithPast:
         hidden_states = hidden_states
         if target_ctx_features is not None:
             target_ctx_features = self.hidden_norm(self.fc(target_ctx_features))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
-        if tree_position_ids is not None:
-            tree_position_embeddings = self.tree_pos_embd(tree_position_ids)
+        if self.config.use_tree_pos_emb:
+            tree_pos_ids = tree_info.tree_position_ids
+            B, N_B, T = tree_pos_ids.shape
+            tree_position_embeddings = self.tree_pos_embd(tree_pos_ids.view(B, N_B * T))
             hidden_states = hidden_states + tree_position_embeddings
 
         for layer in self.layers:
@@ -216,6 +247,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 past_key_value=past_key_values,
                 use_cache=use_cache,
                 position_embeddings=position_embeddings,
+                tree_info=tree_info,
                 **kwargs,
             )
         return self.norm(hidden_states)

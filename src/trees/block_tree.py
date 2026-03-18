@@ -1,7 +1,7 @@
 import torch
 from torch.nn.attention.flex_attention import create_block_mask
 import torch.nn.functional as F
-from . import TreeProcessor, CandidateExtras, InferenceExtras, TrainingExtras
+from . import TreeProcessor, CandidateExtras, InferenceExtras, TrainingExtras, TreeInfo, CHILD_RELATION, DESCENDANT_RELATION, ANCESTOR_RELATION, IS_SELF_RELATION, PARENT_RELATION, expand_tree_info
 
 class BlockTree(TreeProcessor):
     def __init__(self, block_size: int, mask_token_id: int, device: torch.device, random_embds=False):
@@ -11,6 +11,24 @@ class BlockTree(TreeProcessor):
         self.tree_mask = torch.tril(torch.ones((block_size, block_size), dtype=torch.bool, device=device))
         self.parent_idx = torch.arange(block_size, device=device) - 1
         self.random_embds = random_embds
+        depth = torch.arange(block_size, device=device)
+        is_leaf = torch.zeros(block_size, dtype=torch.bool, device=device)
+        is_leaf[-1] = True
+        relation_map = torch.zeros((block_size, block_size), dtype=torch.bool, device=device)
+        relation_map[depth[None, :] < depth[:, None]] = DESCENDANT_RELATION
+        relation_map[depth[None, :] > depth[:, None]] = ANCESTOR_RELATION
+        relation_map[depth[None, :] == depth[:, None] + 1] = CHILD_RELATION
+        relation_map[depth[None, :] + 1 == depth[:, None] + 1] = PARENT_RELATION
+        relation_map[depth[None, :] == depth[:, None]] = IS_SELF_RELATION
+        self.tree_info = TreeInfo(
+            tree_mask=self.tree_mask,
+            parent_idx=self.parent_idx,
+            depth=depth,
+            is_leaf=is_leaf,
+            relation_map=relation_map,
+            tree_position_ids=depth
+
+        )
 
     def construct_candidate_extras(self, drafted_ids, sequence_position_ids, q_values):
         return CandidateExtras(
@@ -32,8 +50,7 @@ class BlockTree(TreeProcessor):
             torch.nn.init.trunc_normal_(noise_embds[:, :, 1:, :])
 
         return InferenceExtras(
-            tree_masks=self.tree_mask[None, None, :],
-            tree_position_ids=None,
+            tree_info=expand_tree_info(self.tree_info, (1, 1)),
             noise_embds=noise_embds,
             sequence_position_ids=torch.arange(self.block_size, device=input_ids.device)[None, None, :] + input_ids.shape[1] - 1,
         )
@@ -80,7 +97,6 @@ class BlockTree(TreeProcessor):
             tree_labels=tree_labels,
             noise_embds=noise_embds,
             sequence_position_ids=sequence_position_ids,
-            tree_position_ids=None,
+            tree_info=expand_tree_info(self.tree_info, (B, N_B)),
             target_hidden_states=target_hidden_states,
-            tree_masks=self.tree_mask[None, None, :, :].expand(B, N_B, -1, -1),
         )
