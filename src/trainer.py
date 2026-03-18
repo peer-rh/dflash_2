@@ -24,7 +24,7 @@ from lightning.fabric.utilities import AttributeDict
 from .trees import TreeProcessor
 from .trees.fixed_tree import FixedTreeProcessor
 from .trees.block_tree import BlockTree
-from .trees.fixed_tree_prunable2 import PrunableTreeProcessor
+from .trees.fixed_tree_prunable import PrunableTreeProcessor
 from .util import SpecializedDynamicCache, merge_metrics, sample, wall_time
 from .data.data_module import DataModule, DataModuleConfig
 from .models.dflash import DFlashDraftModel
