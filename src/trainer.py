@@ -384,7 +384,7 @@ class Trainer:
             target_ctx_features=target_ctx_features,
             attention_mask=drafter_attention_mask,
             position_ids=drafter_position_ids,
-            tree_position_ids=tree_extras.tree_position_ids.reshape(B, N_T * T) if tree_extras.tree_position_ids is not None else None,
+            tree_info=tree_extras.tree_info,
         )
         tree_logits = self.lm_head(tree_hs).view(B, N_T, T, -1)
 
@@ -396,7 +396,7 @@ class Trainer:
             print("Process_batch")
             print("Tree Labels:",)
             for i in range(tree_labels.shape[2]):
-                print(self.tokenizer.decode(tree_labels[0, 0, tree_extras.tree_masks[0, 0, i].bool()]))
+                print(self.tokenizer.decode(tree_labels[0, 0, tree_extras.tree_info.tree_mask[0, 0, i].bool()]))
 
             print("Tree Preds:", self.tokenizer.decode(tree_logits.argmax(dim=-1)[0, 0]))
             print("Loss:", lm_loss.item())
@@ -410,7 +410,7 @@ class Trainer:
             depth = tree_extras.sequence_position_ids[:, :, 1:] - anchors[:, :, None] # [B, N_T, T-1]
             is_accepted = target_labels_aligned == pred_ids[:, :, 1:] # [B, N_T, T-1]
             is_accepted = (
-                is_accepted[:, :, None, :] & tree_extras.tree_masks[:, :, 1:, 1:]
+                is_accepted[:, :, None, :] & tree_extras.tree_info.tree_mask[:, :, 1:, 1:]
             ).sum(dim=-1) == depth # [B, N_T, T-1]
             best = (is_accepted * depth).max(dim=-1)
             acceptance_length = best.values + 1
@@ -433,7 +433,7 @@ class Trainer:
         }
         loss = lm_loss
         if self.drafter.config.use_q_head:
-            q_values = self.drafter.q_head(tree_hs.view(B, N_T, T, -1)[:, :, 1:].to(self.drafter.q_head.weight.dtype))[:, :, :, 0]
+            q_values = self.drafter.q_head(tree_hs.view(B, N_T, T, -1)[:, :, 1:].to(self.drafter.q_head.weight.dtype))[:, :, :, 0] # type: ignore
             q_loss = F.binary_cross_entropy_with_logits(q_values.view(-1), is_correct.view(-1).float(), reduction="sum")
             loss = lm_loss + 0.5 * q_loss
             metrics["q_loss_sum"] = q_loss.detach()
@@ -455,7 +455,7 @@ class Trainer:
     def train_step(self, batch, is_accumulating: bool = True):
         self.drafter.train()
         self.target.eval()
-        with self.fabric.no_backward_sync(self.drafter, enabled=is_accumulating):
+        with self.fabric.no_backward_sync(self.drafter, enabled=is_accumulating): # type: ignore
             loss, metrics = self._train_inner(batch)
         if not is_accumulating:
             self.fabric.clip_gradients(
@@ -489,7 +489,7 @@ class Trainer:
 
         # Prefill the Ta
         past_key_values_drafter = DynamicCache(config=self.drafter.config)
-        past_key_values_target = SpecializedDynamicCache(self.target.config)
+        past_key_values_target = SpecializedDynamicCache(self.target.config) # type: ignore
 
         start_time = wall_time()
         verifier_out = self.target(
@@ -542,14 +542,14 @@ class Trainer:
                 hidden_states=inference_extras.noise_embds.view(1, N_T * T, D),
                 target_ctx_features=target_context_features,
                 position_ids=position_ids,
-                tree_position_ids=(inference_extras.tree_position_ids.view(1, N_T * T) if inference_extras.tree_position_ids is not None else None),
+                tree_info=inference_extras.tree_info,
                 past_key_values=past_key_values_drafter,
                 use_cache=True,
             )
             drafter_logits = self.lm_head(drafter_out)  # [1, N_T * T, V]
             q_values = None
             if self.drafter.config.use_q_head:
-                q_values = torch.sigmoid(self.drafter.q_head(drafter_out.to(self.drafter.q_head.weight.dtype)).view(1, N_T, T))
+                q_values = torch.sigmoid(self.drafter.q_head(drafter_out.to(self.drafter.q_head.weight.dtype)).view(1, N_T, T)) # type: ignore
                 q_values[:, :, 0] = 1.0
             drafter_preds = sample(drafter_logits, 0.0).view(1, N_T, T)  # [1, N_T, T]
             drafter_preds[:, :, 0] = output_ids[0, curr_pos]
@@ -578,7 +578,7 @@ class Trainer:
                 # print("Tree Map:", candidate_extras.tree_masks[0].to(torch.float))
                 print("Position Ids:", candidate_extras.sequence_position_ids[0])
                 print("Verifier Cache Len: ", past_key_values_target.get_seq_end())
-                print("Verifier Cache To Keep: ", past_key_values_target.layers[0].idx_to_keep)
+                print("Verifier Cache To Keep: ", past_key_values_target.layers[0].idx_to_keep) # pyright: ignore[reportAttributeAccessIssue]
 
             def score_mod(score, B, _H, Q, KV):
                 is_pred = KV >= curr_pos

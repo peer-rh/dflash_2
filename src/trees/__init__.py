@@ -3,13 +3,41 @@ from typing import Optional
 from dataclasses import dataclass
 
 @dataclass
+class TreeInfo:
+    tree_mask: torch.Tensor # [..., T, T]
+    parent_idx: torch.Tensor # [..., T]
+    depth: torch.Tensor # [..., T]
+    is_leaf: torch.Tensor # [..., T]
+    relation_map: torch.Tensor # [..., T, T]
+    tree_position_ids: torch.Tensor # [..., T]
+
+UNRELATED_RELATION = 0
+SIBLING_RELATION = 1
+PARENT_RELATION = 2
+CHILD_RELATION = 3
+DESCENDANT_RELATION = 4
+ANCESTOR_RELATION = 5
+IS_SELF_RELATION = 6
+
+
+def expand_tree_info(tree_info: TreeInfo, target_shape: tuple[int, ...]) -> TreeInfo:
+    return TreeInfo(
+        tree_mask=tree_info.tree_mask.expand(*target_shape, -1, -1),
+        parent_idx=tree_info.parent_idx.expand(*target_shape, -1),
+        depth=tree_info.depth.expand(*target_shape, -1),
+        is_leaf=tree_info.is_leaf.expand(*target_shape, -1),
+        relation_map=tree_info.relation_map.expand(*target_shape, -1, -1),
+        tree_position_ids=tree_info.tree_position_ids.expand(*target_shape, -1),
+    )
+
+@dataclass
 class TrainingExtras:
     tree_labels: torch.Tensor # [B, N_T, T]
     noise_embds: torch.Tensor # [B, N_T, T, D]
     sequence_position_ids: torch.Tensor #[B, N_T, T]
-    tree_position_ids: Optional[torch.Tensor] # [B, N_T, T]
     target_hidden_states: list[torch.Tensor] # tuple([B, S, D],...)
-    tree_masks: torch.Tensor # [B, N_T, T, T] 
+    tree_info: TreeInfo
+    
 
 @dataclass
 class CandidateExtras:
@@ -20,10 +48,9 @@ class CandidateExtras:
 
 @dataclass
 class InferenceExtras:
-    tree_masks: torch.Tensor # [1, N_T, T]
     noise_embds: torch.Tensor # [1, N_T, T, D]
     sequence_position_ids: torch.Tensor #[1, N_T, T]
-    tree_position_ids: Optional[torch.Tensor] # [1, N_T, T]
+    tree_info: TreeInfo
 
 class TreeProcessor:
     parent_idx: torch.Tensor
