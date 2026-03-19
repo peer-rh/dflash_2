@@ -380,7 +380,7 @@ class Trainer:
             print("Target Context Features:", target_ctx_features.shape)
             print("Attention Mask:", drafter_attention_mask[0])
 
-        tree_hs = self.drafter(
+        tree_hs, backbone_hidden = self.drafter(
             hidden_states=tree_extras.noise_embds.view(B, N_T * T, -1),
             target_ctx_features=target_ctx_features,
             attention_mask=drafter_attention_mask,
@@ -545,7 +545,7 @@ class Trainer:
                 print("Noise Embeddings:", noise_embds.shape)
                 print("Drafter KV Cache Len: ", past_key_values_drafter.get_seq_length())
 
-            drafter_out = self.drafter(
+            drafter_out, backbone_hidden = self.drafter(
                 hidden_states=inference_extras.noise_embds.view(1, N_T * T, D),
                 target_ctx_features=target_context_features,
                 position_ids=position_ids,

@@ -188,8 +188,10 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         if isinstance(config, dict):
             config = Qwen3Config(**config)
         super().__init__(config)
-        self.config._attn_implementation = "flex_attention"
+        config._attn_implementation = "flex_attention"
         self.config = config
+        self.config.hidden_size = config.hidden_size * 2
+        self.config.intermediate_size = config.intermediate_size * 2
         self.layers = nn.ModuleList(
             [Qwen3DFlashDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
@@ -199,19 +201,6 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.fc = nn.Linear(len(self.target_layer_ids) * config.hidden_size, config.hidden_size, bias=False)
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.block_size = config.block_size
-        self.mask_token_id = self.config.dflash_config.get("mask_token_id", None)
-        if not hasattr(config, "use_tree_pos_emb"):
-            self.config.use_tree_pos_emb = False
-        if self.config.use_tree_pos_emb:
-            self.tree_pos_embd = nn.Embedding(config.max_tree_size, config.hidden_size)
-        
-        self.q_head = None
-        if not hasattr(config, "use_q_head"):
-            self.config.use_q_head = False
-        if self.config.use_q_head:
-            self.q_head = nn.Linear(config.hidden_size, 1, bias=False)
-        
-        self.backbone_layer = self.config.get("backbone_layer", None)
         
         self.post_init()
 
@@ -222,25 +211,20 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
 
     def forward(
         self,
+        inpus_embds: torch.Tensor,
+        backbone_hidden_states: torch.Tensor,
         position_ids: torch.LongTensor,
         tree_info: TreeInfo,  
         attention_mask: Optional[torch.Tensor] = None,
-        hidden_states: Optional[torch.Tensor] = None,
         target_ctx_features: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: bool = False,
         **kwargs,
     ) -> CausalLMOutputWithPast:
-        hidden_states = hidden_states
+        hidden_states = torch.cat([inpus_embds, backbone_hidden_states], dim=-1)
         if target_ctx_features is not None:
             target_ctx_features = self.hidden_norm(self.fc(target_ctx_features))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
-        backbone_hs = None
-        if self.config.use_tree_pos_emb:
-            tree_pos_ids = tree_info.tree_position_ids
-            B, N_B, T = tree_pos_ids.shape
-            tree_position_embeddings = self.tree_pos_embd(tree_pos_ids.reshape(B, N_B * T))
-            hidden_states = hidden_states + tree_position_embeddings
 
         for i, layer in enumerate(self.layers):
             hidden_states = layer(
@@ -254,6 +238,4 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 tree_info=tree_info,
                 **kwargs,
             )
-            if i == self.backbone_layer:
-                backbone_hs = hidden_states
-        return self.norm(hidden_states), backbone_hs
+        return self.norm(hidden_states)
