@@ -18,9 +18,11 @@ class PrunableTreeProcessor(TreeProcessor):
         n_candidate_tokens: int | None,
         mask_token_id: int,
         device: torch.device,
+        n_branches: int | None = None,
     ) -> None:
         super().__init__()
         self.n_candidate_tokens = n_candidate_tokens 
+        self.n_branches = n_branches
         left_most_path = paths[left_most_idx]
         distances_from_left_most = []
         left_most_ancestors = []

@@ -96,7 +96,7 @@ TREE_JSON=$(cat <<EOF
 EOF
 )
 
-uv run -m src.trainer --run_name $EXPERIMENT_NAME --seed 42 --trainer.compile false --trainer.verbose true \
+uv run -m src.trainer --run_name $EXPERIMENT_NAME --seed 42 --trainer.compile true --trainer.verbose false \
     --drafter "$MODEL_JSON" \
     --target $TARGET_MODEL \
     --data.data_path ../dflash/datasets/qwen3-4b/ \
