@@ -236,7 +236,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         if self.config.use_tree_pos_emb:
             tree_pos_ids = tree_info.tree_position_ids
             B, N_B, T = tree_pos_ids.shape
-            tree_position_embeddings = self.tree_pos_embd(tree_pos_ids.view(B, N_B * T))
+            tree_position_embeddings = self.tree_pos_embd(tree_pos_ids.reshape(B, N_B * T))
             hidden_states = hidden_states + tree_position_embeddings
 
         for layer in self.layers:
