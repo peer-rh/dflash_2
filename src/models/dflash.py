@@ -235,8 +235,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         if target_ctx_features is not None:
             target_ctx_features = self.hidden_norm(self.fc(target_ctx_features))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
-        # # backbone_hs = None
-        # if self.config.use_tree_pos_emb:
+        backbone_hs = None
+        if self.config.use_tree_pos_emb:
             tree_pos_ids = tree_info.tree_position_ids
             B, N_B, T = tree_pos_ids.shape
             tree_position_embeddings = self.tree_pos_embd(tree_pos_ids.reshape(B, N_B * T))
