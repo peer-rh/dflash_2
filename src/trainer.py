@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Literal, Sequence, get_args, get_origin
+from typing import Any, Literal, Optional, Sequence, get_args, get_origin
 import time
 
 from jsonargparse import ActionConfigFile, ArgumentParser
@@ -22,9 +22,9 @@ from wandb.integration.lightning.fabric import WandbLogger
 from lightning.fabric.utilities import AttributeDict
 
 from .trees import TreeProcessor
-from .trees.fixed_tree import FixedTreeProcessor
 from .trees.block_tree import BlockTree
 from .trees.fixed_tree_prunable import PrunableTreeProcessor
+# from .trees.tree_v2 import PrunableTreeProcessor
 from .util import SpecializedDynamicCache, merge_metrics, sample, wall_time
 from .data.data_module import DataModule, DataModuleConfig
 from .models.dflash import DFlashDraftModel
@@ -47,6 +47,7 @@ class TrainerConfig:
     verbose: bool = False
     checkpoint_path: str = "checkpoints"
     compile: bool = False
+    loss_weighting: Optional[Literal["target_probs"]] = None # TODO: Add support for decay in dflash
 
 
 class Trainer:
@@ -134,7 +135,7 @@ class Trainer:
         self.target = self.fabric.to_device(self.target)
 
         if tree_type == "fixed":
-            self.tree_processor = FixedTreeProcessor(**tree_args, mask_token_id=self.mask_token_id, device=self.fabric.device)
+            self.tree_processor = PrunableTreeProcessor(**tree_args, n_candidate_tokens=None, mask_token_id=self.mask_token_id, device=self.fabric.device)
         elif tree_type == "prunable":
             self.tree_processor = PrunableTreeProcessor(**tree_args, mask_token_id=self.mask_token_id, device=self.fabric.device)
         elif tree_type == "block":
@@ -389,16 +390,22 @@ class Trainer:
         tree_logits = self.lm_head(tree_hs).view(B, N_T, T, -1)
 
         lm_loss = F.cross_entropy(
-            tree_logits.view(-1, tree_logits.size(-1)), tree_labels.view(-1), reduction="sum"
-        )
+            tree_logits.view(-1, tree_logits.size(-1)), tree_labels.view(-1), reduction="none"
+        ).view(B, N_T, T) # [B, N_T, T]
+        if self.config.loss_weighting is None:
+            lm_loss = lm_loss.sum()
+        elif self.config.loss_weighting == "target_probs":
+            lm_loss = (lm_loss * tree_extras.tree_cum_prob).sum()
+
         if self.config.verbose:
             print('--')
             print("Process_batch")
             print("Tree Labels:",)
             for i in range(tree_labels.shape[2]):
                 print(self.tokenizer.decode(tree_labels[0, 0, tree_extras.tree_info.tree_mask[0, 0, i].bool()]))
-
             print("Tree Preds:", self.tokenizer.decode(tree_logits.argmax(dim=-1)[0, 0]))
+            print("Verifier AR Probs:", tree_extras.tree_ar_prob[0, 0])
+            print("Verifier Cum Prods: ", tree_extras.tree_cum_prob[0, 0])
             print("Loss:", lm_loss.item())
         with torch.no_grad():
             pred_ids = tree_logits.argmax(dim=-1)

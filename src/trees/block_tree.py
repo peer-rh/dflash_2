@@ -90,11 +90,26 @@ class BlockTree(TreeProcessor):
         noise_embds = target.get_input_embeddings()(noise_input_ids) # [B, N_B, B_S, D]
         if self.random_embds:
             torch.nn.init.trunc_normal_(noise_embds[:, :, 1:, :])
-        sequence_position_ids = torch.arange(self.block_size, device=input_ids.device)[None, None, :] + anchors[:, :, None]
-        tree_labels = torch.gather(input_ids, 1, sequence_position_ids.view(B, N_B * self.block_size)).view(B, N_B, self.block_size)
+        physical_position_ids = torch.arange(self.block_size, device=input_ids.device)[None, None, :] + anchors[:, :, None]
+
+        tree_labels = torch.gather(input_ids, 1, physical_position_ids.view(B, N_B * self.block_size)).view(B, N_B, self.block_size)
+
+        target_ar_probs = F.softmax(prefill_out.logits[:, :-1], dim=-1) # [B, S-1, V]
+        target_ar_probs = torch.gather(target_ar_probs, 2, input_ids[:, 1:, None]).squeeze(2) # [B, S-1] # [:, 0] is pron of token at pos 1
+        tree_ar_probs = torch.gather(target_ar_probs, 1, physical_position_ids.view(B, N_B * self.block_size) - 1).view(B, N_B, self.block_size) # [B, N_B, B_S]
+        tree_ar_probs[:, :, 0] = 1.0 # We assume collapsed prob at root 
+        tree_cum_probs = torch.cumprod(tree_ar_probs, dim=2)
+
+        anchor_position_ids = torch.gather(position_ids, 1, anchors) # [B, N_B]
+        sequence_position_ids = torch.arange(self.block_size, device=input_ids.device)[None, None, :] + anchor_position_ids[:, :, None] # [B, N_B, B_S]
+
+
 
         return TrainingExtras(
             tree_labels=tree_labels,
+            seq_labels=tree_labels,
+            tree_ar_prob=tree_ar_probs,
+            tree_cum_prob=tree_cum_probs,
             noise_embds=noise_embds,
             sequence_position_ids=sequence_position_ids,
             tree_info=expand_tree_info(self.tree_info, (B, N_B)),

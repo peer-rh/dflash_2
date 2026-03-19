@@ -33,6 +33,9 @@ def expand_tree_info(tree_info: TreeInfo, target_shape: tuple[int, ...]) -> Tree
 @dataclass
 class TrainingExtras:
     tree_labels: torch.Tensor # [B, N_T, T]
+    seq_labels: torch.Tensor # [B, N_T, T']
+    tree_ar_prob: torch.Tensor # [B, N_T, T] 
+    tree_cum_prob: torch.Tensor # [B, N_T, T] # Note that root token is assumed to have prob 1
     noise_embds: torch.Tensor # [B, N_T, T, D]
     sequence_position_ids: torch.Tensor #[B, N_T, T]
     target_hidden_states: list[torch.Tensor] # tuple([B, S, D],...)

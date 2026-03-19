@@ -107,7 +107,7 @@ class PrunableTreeProcessor(TreeProcessor):
     ):
         B, S = input_ids.shape
         B, N_T = anchors.shape
-        target_hidden_states, tree_labels = self._generate_labels(
+        target_hidden_states, tree_labels, tree_ar_prob, tree_cum_prob = self._generate_labels(
             input_ids=input_ids,
             position_ids=position_ids,
             document_masks=document_mask,
@@ -123,10 +123,14 @@ class PrunableTreeProcessor(TreeProcessor):
         )
         noise_embds = target.get_input_embeddings()(noise_input_ids)
 
-        sequence_position_ids = self.seq_positions[None, None, :] + anchors[:, :, None]
+        anchor_position_ids = torch.gather(position_ids, 1, anchors) # [B, N_T]
+        sequence_position_ids = self.seq_positions[None, None, :] + anchor_position_ids[:, :, None]
 
         return TrainingExtras(
             tree_labels=tree_labels,
+            seq_labels = tree_labels[:, :, self.is_left_most],
+            tree_ar_prob=tree_ar_prob, 
+            tree_cum_prob=tree_cum_prob,
             noise_embds=noise_embds,
             sequence_position_ids=sequence_position_ids,
             target_hidden_states=target_hidden_states,
@@ -235,21 +239,31 @@ class PrunableTreeProcessor(TreeProcessor):
         target_hidden_states = prefill_out.hidden_states
         logits = prefill_out.logits
 
-        left_most_indexes = torch.nonzero(self.is_left_most, as_tuple=True)[0]
         tree_labels = torch.zeros(
             (B, N_B, self.tree_size), dtype=torch.long, device=input_ids.device
         )
-        for i in left_most_indexes:
-            tree_labels[:, :, i] = torch.gather(input_ids, 1, anchors + i)
-            is_child = self.parent_idx == i
-            this_logits = torch.gather(
-                logits, 1, i + anchors[:, :, None].expand(-1, -1, logits.shape[-1])
-            )  # [B, N_B, vocab_size]
-            this_logits.scatter_(-1, tree_labels[:, :, i : i + 1], -torch.inf)
-            this_logits_topk = torch.topk(this_logits, k=8, dim=-1).indices
-            child_ranks = self.top_k[is_child].long()
-            tree_labels[:, :, is_child] = this_logits_topk[:, :, child_ranks]
+        tree_ar_prob = torch.zeros(
+            (B, N_B, self.tree_size), dtype=logits.dtype, device=input_ids.device
+        )
+        tree_ar_prob[:, :, 0] = 1.0
 
+        physical_position_ids = self.seq_positions[None, None, self.is_left_most] + anchors[:, :, None]
+        tree_labels[:, :, self.is_left_most] = torch.gather(input_ids, 1, physical_position_ids.view(B, -1)).view(B, N_B, -1)
+        for i in torch.nonzero(self.is_left_most & ~self.is_leaf, as_tuple=True)[0]:
+            this_logits = torch.gather(
+                logits, 1, i + anchors[:, :, None].expand(-1, -1, logits.shape[-1]) 
+            )  # [B, N_B, vocab_size]
+            probs = F.softmax(this_logits, dim=-1) 
+            lm_child_label = tree_labels[:,:,  i+1] # B, N_B
+            tree_ar_prob[:, :, i+1] = torch.gather(
+                probs, 2, lm_child_label[:, :, None]
+            ).squeeze(-1)
+            probs.scatter_(2, lm_child_label[:, :, None], torch.inf) # Should always be top 1 after this
+            r_children = (self.parent_idx == i) & ~self.is_left_most
+            children_topk = torch.topk(probs, k=8, dim=-1)
+            child_k = self.top_k[r_children].long()
+            tree_labels[:, :, r_children] = children_topk.indices[:, :, child_k]
+            tree_ar_prob[:, :, r_children] = children_topk.values[:, :, child_k]
         next_input_idx = torch.arange(self.tree_size, device=input_ids.device)[
             (self.distance_to_left_most == 1) & ~self.is_leaf
         ]
@@ -318,19 +332,26 @@ class PrunableTreeProcessor(TreeProcessor):
             this_logits = outputs.logits.view(B, -1, N_B, logits.shape[-1]).transpose(
                 1, 2
             )  # [B, N_B, width, vocab_size]
-            this_logits_topk = torch.topk(this_logits, k=8, dim=-1).indices
+            this_probs = F.softmax(this_logits, dim=-1)
+            this_probs_topk = torch.topk(this_probs, k=8, dim=-1) # [B, N_B, width, topk]
             all_children = torch.zeros(
                 (self.tree_size), dtype=torch.bool, device=input_ids.device
             )
             # is_any_child = (self.parent[None, :] == next_input_idx[:, None]).any(dim=0)
             for i, par in enumerate(next_input_idx):
                 children = self.parent_idx == par
-                tree_labels[:, :, children] = this_logits_topk[
+                tree_labels[:, :, children] = this_probs_topk.indices[
+                    :, :, i, self.top_k[children]
+                ]
+                tree_ar_prob[:, :, children] = this_probs_topk.values[
                     :, :, i, self.top_k[children]
                 ]
                 all_children[children] = True
             next_input_idx = torch.nonzero(all_children & ~self.is_leaf, as_tuple=True)[
                 0
             ]
-            
-        return target_hidden_states, tree_labels
+
+        tree_cum_prob = torch.where(
+            self.full_tree_mask, tree_ar_prob[:, :, None, :], 1.0
+        ).prod(dim=-1) # [B, N_B, T]
+        return target_hidden_states, tree_labels, tree_ar_prob, tree_cum_prob
