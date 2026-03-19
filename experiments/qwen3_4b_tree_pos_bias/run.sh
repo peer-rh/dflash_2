@@ -79,7 +79,7 @@ MODEL_JSON=$(cat <<EOF
   "use_cache": true,
   "use_sliding_window": false,
   "vocab_size": 151936,
-  "use_tree_pos_emb": false,
+  "use_tree_pos_emb": true,
   "use_additive_tree_pos_bias": true,
   "max_tree_size": 32,
   "use_q_head": false

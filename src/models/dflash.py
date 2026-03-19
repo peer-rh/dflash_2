@@ -59,6 +59,7 @@ class Qwen3DFlashAttention(nn.Module):
             config.use_additive_tree_pos_bias = False
         if config.use_additive_tree_pos_bias:
             self.tree_pos_bias = nn.Embedding(10, config.num_attention_heads)
+            self.tree_pos_bias.weight.data.zero_()
 
     def forward(
         self,
