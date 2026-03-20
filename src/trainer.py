@@ -387,15 +387,35 @@ class Trainer:
             position_ids=drafter_position_ids,
             tree_info=tree_extras.tree_info,
         )
-        tree_logits = self.lm_head(tree_hs).view(B, N_T, T, -1)
+        tree_logits = self.lm_head(tree_hs.view(B, N_T, T, -1)[:, :, 1:]) # [B, N_T, T-1, N_VOCAB]
 
         lm_loss = F.cross_entropy(
-            tree_logits.view(-1, tree_logits.size(-1)), tree_labels.view(-1), reduction="none"
-        ).view(B, N_T, T) # [B, N_T, T]
+            tree_logits.view(-1, tree_logits.size(-1)), tree_labels[:, :, 1:].reshape(-1), reduction="none"
+        ).view(B, N_T, T-1) # [B, N_T, T]
         if self.config.loss_weighting is None:
             lm_loss = lm_loss.sum()
         elif self.config.loss_weighting == "target_probs":
-            lm_loss = (lm_loss * tree_extras.tree_cum_prob).sum()
+            with torch.no_grad():
+                cum_prod = tree_extras.tree_cum_prob[:, :, 1:].detach()
+                # Make sure the weights sum to T as in unweighted case
+                w = cum_prod / cum_prod.sum(dim=-1, keepdim=True).clamp(min=1e-8) * (T-1)
+                w = w.detach().clone()  # fully sever from graph
+
+            lm_loss = (lm_loss * w).sum()
+        # targets = tree_labels[:, :, 1:]
+
+        # if self.config.loss_weighting is None:
+        #     log_probs = F.log_softmax(tree_logits, dim=-1)
+        #     lm_loss = -log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1).sum()
+        # elif self.config.loss_weighting == "target_probs":
+        #     with torch.no_grad():
+        #         w = tree_extras.tree_cum_prob[:, :, 1:]
+        #         w = w / w.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        #         w = w * (T - 1)
+
+        #     log_probs = F.log_softmax(tree_logits, dim=-1)
+        #     gathered = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+        #     lm_loss = -(gathered * w).sum()
 
         if self.config.verbose:
             print('--')
@@ -409,13 +429,13 @@ class Trainer:
             print("Loss:", lm_loss.item())
         with torch.no_grad():
             pred_ids = tree_logits.argmax(dim=-1)
-            is_correct = pred_ids[:, :, 1:] == tree_labels[:, :, 1:] # [B, N_T, T-1]
+            is_correct = pred_ids == tree_labels[:, :, 1:] # [B, N_T, T-1]
 
             target_labels_aligned = input_ids.gather(1, 
                 tree_extras.sequence_position_ids[:, :, 1:].reshape(B, N_T * (T - 1))
             ).view(B, N_T, T - 1)
             depth = tree_extras.sequence_position_ids[:, :, 1:] - anchors[:, :, None] # [B, N_T, T-1]
-            is_accepted = target_labels_aligned == pred_ids[:, :, 1:] # [B, N_T, T-1]
+            is_accepted = target_labels_aligned == pred_ids # [B, N_T, T-1]
             is_accepted = (
                 is_accepted[:, :, None, :] & tree_extras.tree_info.tree_mask[:, :, 1:, 1:]
             ).sum(dim=-1) == depth # [B, N_T, T-1]

@@ -195,6 +195,7 @@ class PrunableTreeProcessor(TreeProcessor):
             ).view(1, 1, self.tree_size, -1),
         )
 
+    @torch.no_grad()
     @torch.compiler.disable()
     def _generate_labels(
         self,
@@ -259,13 +260,13 @@ class PrunableTreeProcessor(TreeProcessor):
             lm_child_label = tree_labels[:,:,  i+1] # B, N_B
             tree_ar_prob[:, :, i+1] = torch.gather(
                 probs, 2, lm_child_label[:, :, None]
-            ).squeeze(-1)
+            ).squeeze(-1).detach() # B, N_B
             probs.scatter_(2, lm_child_label[:, :, None], torch.inf) # Should always be top 1 after this
             r_children = (self.parent_idx == i) & ~self.is_left_most
             children_topk = torch.topk(probs, k=8, dim=-1)
             child_k = self.top_k[r_children].long()
             tree_labels[:, :, r_children] = children_topk.indices[:, :, child_k]
-            tree_ar_prob[:, :, r_children] = children_topk.values[:, :, child_k]
+            tree_ar_prob[:, :, r_children] = children_topk.values[:, :, child_k].detach()
         next_input_idx = torch.arange(self.tree_size, device=input_ids.device)[
             (self.distance_to_left_most == 1) & ~self.is_leaf
         ]
@@ -347,7 +348,7 @@ class PrunableTreeProcessor(TreeProcessor):
                 ]
                 tree_ar_prob[:, :, children] = this_probs_topk.values[
                     :, :, i, self.top_k[children]
-                ]
+                ].detach()
                 all_children[children] = True
             next_input_idx = torch.nonzero(all_children & ~self.is_leaf, as_tuple=True)[
                 0
@@ -356,4 +357,5 @@ class PrunableTreeProcessor(TreeProcessor):
         tree_cum_prob = torch.where(
             self.full_tree_mask, tree_ar_prob[:, :, None, :], 1.0
         ).prod(dim=-1) # [B, N_B, T]
-        return target_hidden_states, tree_labels, tree_ar_prob, tree_cum_prob
+        tree_cum_prob = tree_cum_prob.clone().detach()
+        return target_hidden_states.detach(), tree_labels.detach(), tree_ar_prob.detach(), tree_cum_prob.detach()
