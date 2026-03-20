@@ -103,4 +103,8 @@ uv run -m src.trainer --run_name $EXPERIMENT_NAME --seed 42 --trainer.compile tr
     --data.batch_size 24 --data.seq_len 3072 --data.n_blocks 64 --data.block_size 24 \
     --data.num_workers 4 --trainer.checkpoint_path $checkpoint_path \
     --trainer.grad_accum_steps 3 --trainer.log_every 10 --trainer.num_epochs 8  --trainer.eval_every 2048 --trainer.save_every 2048 \
-    --tree_type prunable --tree_args "$TREE_JSON" --trainer.ddp false --trainer.precision 'bf16-true'  
+    --tree_type prunable --tree_args "$TREE_JSON" --trainer.ddp false --trainer.precision 'bf16-true' \
+    --trainer.sibling_overlap_loss_enabled true \
+    --trainer.sibling_overlap_loss_weight 0.1 \
+    --trainer.sibling_overlap_temperature 0.5 \
+    --trainer.sibling_overlap_topk 8

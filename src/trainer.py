@@ -48,6 +48,10 @@ class TrainerConfig:
     checkpoint_path: str = "checkpoints"
     compile: bool = False
     loss_weighting: Optional[Literal["target_probs"]] = None # TODO: Add support for decay in dflash
+    sibling_overlap_loss_enabled: bool = False
+    sibling_overlap_loss_weight: float = 0.0
+    sibling_overlap_temperature: float = 0.5
+    sibling_overlap_topk: int = 8
 
 
 class Trainer:
@@ -143,6 +147,19 @@ class Trainer:
         else:
             raise ValueError(f"Unsupported tree type: {tree_type}")
 
+        parent_idx = self.tree_processor.get_parent_idx()[1:]
+        same_parent = parent_idx[:, None] == parent_idx[None, :]
+        valid_parent = (parent_idx[:, None] >= 0) & (parent_idx[None, :] >= 0)
+        distinct_nodes = ~torch.eye(parent_idx.shape[0], dtype=torch.bool, device=parent_idx.device)
+        upper_triangle = torch.triu(
+            torch.ones_like(same_parent, dtype=torch.bool),
+            diagonal=1,
+        )
+        sibling_pairs = (same_parent & valid_parent & distinct_nodes & upper_triangle).nonzero(as_tuple=False)
+        self.sibling_pair_i = sibling_pairs[:, 0]
+        self.sibling_pair_j = sibling_pairs[:, 1]
+        self.num_sibling_pairs = int(sibling_pairs.shape[0])
+
         self.global_step = 0
         if self.config.dev_run:
             self.config.num_epochs = 1
@@ -150,6 +167,37 @@ class Trainer:
         if self.config.compile:
             self.process_batch = torch.compile(self.process_batch)
             self._train_inner = torch.compile(self._train_inner)
+
+    def _compute_sibling_overlap_loss(self, tree_logits: torch.Tensor) -> torch.Tensor:
+        if (
+            not self.config.sibling_overlap_loss_enabled
+            or self.config.sibling_overlap_loss_weight == 0.0
+            or self.num_sibling_pairs == 0
+        ):
+            return tree_logits.new_zeros(())
+
+        topk = min(self.config.sibling_overlap_topk, tree_logits.size(-1))
+        if topk <= 0:
+            return tree_logits.new_zeros(())
+
+        temperature = max(self.config.sibling_overlap_temperature, 1e-6)
+        top_vals, top_idx = torch.topk(tree_logits / temperature, k=topk, dim=-1)
+        top_probs = F.softmax(top_vals, dim=-1)
+
+        idx_i = top_idx[:, :, self.sibling_pair_i]
+        idx_j = top_idx[:, :, self.sibling_pair_j]
+        prob_i = top_probs[:, :, self.sibling_pair_i]
+        prob_j = top_probs[:, :, self.sibling_pair_j]
+
+        match = idx_i[..., :, None] == idx_j[..., None, :]
+        pair_overlap = (
+            match.to(top_probs.dtype)
+            * prob_i[..., :, None]
+            * prob_j[..., None, :]
+        ).sum(dim=(-1, -2))
+
+        block_overlap = pair_overlap.mean(dim=-1)
+        return block_overlap.sum() * tree_logits.shape[2]
 
     def fit(self):
         for epoch in range(self.config.num_epochs):
@@ -388,6 +436,7 @@ class Trainer:
             tree_info=tree_extras.tree_info,
         )
         tree_logits = self.lm_head(tree_hs.view(B, N_T, T, -1)[:, :, 1:]) # [B, N_T, T-1, N_VOCAB]
+        sibling_overlap_loss = self._compute_sibling_overlap_loss(tree_logits)
 
         lm_loss = F.cross_entropy(
             tree_logits.view(-1, tree_logits.size(-1)), tree_labels[:, :, 1:].reshape(-1), reduction="none"
@@ -430,6 +479,12 @@ class Trainer:
         with torch.no_grad():
             pred_ids = tree_logits.argmax(dim=-1)
             is_correct = pred_ids == tree_labels[:, :, 1:] # [B, N_T, T-1]
+            sibling_pair_count = B * N_T * self.num_sibling_pairs
+            sibling_argmax_collision_count = pred_ids.new_zeros((), dtype=torch.long)
+            if self.num_sibling_pairs > 0:
+                sibling_argmax_collision_count = (
+                    pred_ids[:, :, self.sibling_pair_i] == pred_ids[:, :, self.sibling_pair_j]
+                ).sum()
 
             target_labels_aligned = input_ids.gather(1, 
                 tree_extras.sequence_position_ids[:, :, 1:].reshape(B, N_T * (T - 1))
@@ -452,17 +507,20 @@ class Trainer:
 
         metrics = {
             "lm_loss_sum": lm_loss.detach(),
+            "sibling_overlap_loss_sum": sibling_overlap_loss.detach(),
             "batch_count": B,
             "block_count": B * N_T,
+            "sibling_pair_count": sibling_pair_count,
+            "sibling_argmax_collision_count": sibling_argmax_collision_count.detach(),
             "token_count": B * N_T * T,
             "token_correct_count": is_correct.sum().detach(),
             "accepted_length_sum": acceptance_length.sum().detach(),
         }
-        loss = lm_loss
+        loss = lm_loss + self.config.sibling_overlap_loss_weight * sibling_overlap_loss
         if self.drafter.config.use_q_head:
             q_values = self.drafter.q_head(tree_hs.view(B, N_T, T, -1)[:, :, 1:].to(self.drafter.q_head.weight.dtype))[:, :, :, 0] # type: ignore
             q_loss = F.binary_cross_entropy_with_logits(q_values.view(-1), is_correct.view(-1).float(), reduction="sum")
-            loss = lm_loss + 0.5 * q_loss
+            loss = loss + 0.5 * q_loss
             metrics["q_loss_sum"] = q_loss.detach()
             metrics["q_accuracy_count"] = ((q_values > 0) == is_correct).sum().detach()
             if self.config.verbose:
@@ -704,9 +762,16 @@ class Trainer:
 
         metrics = {
             "lm_loss" : reduced_metrics['lm_loss_sum'] / reduced_metrics['token_count'], 
+            "sibling_overlap_loss": reduced_metrics['sibling_overlap_loss_sum'] / reduced_metrics['token_count'],
             "total_accuracy": reduced_metrics['token_correct_count'] / reduced_metrics['token_count'], 
             "accepted_length": reduced_metrics['accepted_length_sum'] / reduced_metrics['block_count'],
         }
+        if reduced_metrics['sibling_pair_count'] > 0:
+            metrics["sibling_argmax_collision_rate"] = (
+                reduced_metrics['sibling_argmax_collision_count'] / reduced_metrics['sibling_pair_count']
+            )
+        else:
+            metrics["sibling_argmax_collision_rate"] = 0.0
         # TODO: Support this
         # for k, v in reduced_metrics.items():
         #     if k.startswith("pos_wise_correct_count"):
