@@ -86,14 +86,14 @@ MODEL_JSON=$(cat <<MODELEOF
   "use_tree_pos_emb": true,
   "use_additive_tree_pos_bias": true,
   "max_tree_size": 128,
-  "use_q_head": false
+  "use_q_head": true,
 }
 MODELEOF
 )
 TREE_JSON=$(cat <<TREEEOF
 {
     "depth": 8,
-    "n_candidate_tokens": null,
+    "n_candidate_tokens": 32,
     "n_compute_branches": 256
 }
 TREEEOF
