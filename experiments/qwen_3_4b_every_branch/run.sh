@@ -5,6 +5,7 @@
 #SBATCH --mem=48G
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=4
+#SBATCH --gres=gpu:1
 #SBATCH --time=0-08:00:00
 #SBATCH --gpus-per-task=1
 #CommentSBATCH --gpus-per-task=1
