@@ -8,7 +8,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --time=0-08:00:00
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-task=1
+#CommentSBATCH --gpus-per-task=1
 #CommentSBATCH --nodelist=tikgpu08 # Specify that it should run on this particular node
 #CommentSBATCH --account=tik-internal
 #CommentSBATCH --constraint='geforce_rtx_3090'
