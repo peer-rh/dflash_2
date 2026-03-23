@@ -1,7 +1,7 @@
 # Title
 > Tags: #experiment
 > Run Script: run.sh
-> Git Checkout: ecfcb0999acdd982dcc72485dbd998797d60e8e5
+> Git Checkout: 0668eea029ac53d284c0de93e7a1712831f49a3b
 > WandB URL:
 
 ## Description

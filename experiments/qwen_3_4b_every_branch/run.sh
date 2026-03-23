@@ -34,7 +34,7 @@ checkpoint_path="$OUTPUT_DIR/checkpoints"
 mkdir -p $checkpoint_path
 
 TARGET_MODEL="Qwen/Qwen3-4B"
-MODEL_JSON=$(cat <<EOF
+MODEL_JSON=$(cat <<MODELEOF
 {
   "architectures": [
     "DFlashDraftModel"
@@ -89,15 +89,15 @@ MODEL_JSON=$(cat <<EOF
   "max_tree_size": 128,
   "use_q_head": false
 }
-EOF
+MODELEOF
 )
-TREE_JSON=$(cat <<EOF
+TREE_JSON=$(cat <<TREEEOF
 {
     "depth": 8,
     "n_candidate_tokens": null,
     "n_compute_branches": 256
 }
-EOF
+TREEEOF
 )
 
 python -m src.trainer --run_name $EXPERIMENT_NAME --seed 42 --trainer.compile true --trainer.verbose false \
