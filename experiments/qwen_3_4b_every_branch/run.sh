@@ -5,8 +5,11 @@
 #SBATCH --mem=48G
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=4
-#SBATCH --gres=gpu:3
-#SBATCH --nodelist=tikgpu08 # Specify that it should run on this particular node
+#SBATCH --gres=gpu:1
+#SBATCH --time=0-08:00:00
+#SBATCH --ntasks-per-node=1
+#SBATCH --gpus-per-task=1
+#CommentSBATCH --nodelist=tikgpu08 # Specify that it should run on this particular node
 #CommentSBATCH --account=tik-internal
 #CommentSBATCH --constraint='geforce_rtx_3090'
 #CommentSBATCH --constraint='rtx_a6000'
@@ -19,11 +22,13 @@ echo "In directory: $(pwd)"
 echo "Starting on: $(date)"
 echo "SLURM_JOB_ID: ${SLURM_JOB_ID}"
 
-ETH_USERNAME=prheinboldt
-PROJECT_NAME=dflash_2
-DIRECTORY="/itet-stor/${ETH_USERNAME}/net_scratch/${PROJECT_NAME}"
+#ETH_USERNAME=prheinboldt
+# PROJECT_NAME=dflash_2
+#DIRECTORY="/itet-stor/${ETH_USERNAME}/net_scratch/${PROJECT_NAME}"
 
-cd $DIRECTORY
+uenv run pytorch/v2.9.1:v2 --view=default bash <<'EOF'
+cd ~/dflash_2
+source venv-2.9/bin/activate
 
 checkpoint_path="$OUTPUT_DIR/checkpoints"
 mkdir -p $checkpoint_path
@@ -88,18 +93,19 @@ EOF
 )
 TREE_JSON=$(cat <<EOF
 {
-    "depth": 16,
+    "depth": 8,
     "n_candidate_tokens": null,
     "n_compute_branches": 256
 }
 EOF
 )
 
-uv run -m src.trainer --run_name $EXPERIMENT_NAME --seed 42 --trainer.compile true --trainer.verbose false \
+python -m src.trainer --run_name $EXPERIMENT_NAME --seed 42 --trainer.compile true --trainer.verbose false \
     --drafter "$MODEL_JSON" \
     --target $TARGET_MODEL \
-    --data.data_path ../dflash/datasets/qwen3-4b/ \
-    --data.batch_size 1 --data.seq_len 3072 --data.n_blocks 64 --data.block_size 24 \
-    --data.num_workers 4 --trainer.checkpoint_path $checkpoint_path \
-    --trainer.grad_accum_steps 12 --trainer.log_every 10 --trainer.num_epochs 8  --trainer.eval_every 2048 --trainer.save_every 2048 \
-    --tree_type every_branch --tree_args "$TREE_JSON" --trainer.ddp false --trainer.precision 'bf16-true'   --trainer.loss_weighting "target_probs" --trainer.ddp true
+    --data.data_path peerrh/q3_4b_100k \
+    --data.batch_size 12 --data.seq_len 3072 --data.n_blocks 64 --data.block_size 24 \
+    --data.num_workers 6 --trainer.checkpoint_path $checkpoint_path \
+    --trainer.grad_accum_steps 4 --trainer.log_every 10 --trainer.num_epochs 8  --trainer.eval_every 2048 --trainer.save_every 2048 \
+    --tree_type every_branch --tree_args "$TREE_JSON" --trainer.ddp false --trainer.precision 'bf16-true'   --trainer.loss_weighting "target_probs"
+EOF

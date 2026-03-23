@@ -543,10 +543,10 @@ class Trainer:
     def train_step(self, batch, is_accumulating: bool = True):
         self.drafter.train()
         self.target.eval()
-        self.step += 1
         with self.fabric.no_backward_sync(self.drafter, enabled=is_accumulating): # type: ignore
             loss, metrics = self._train_inner(batch)
         if not is_accumulating:
+            self.step += 1
             self.fabric.clip_gradients(
                 self.drafter,
                 self.optim,

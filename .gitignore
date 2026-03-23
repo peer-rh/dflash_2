@@ -11,3 +11,4 @@ wheels/
 /experiments/**/outputs/
 wandb
 datasets
+venv-2.9

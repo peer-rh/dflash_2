@@ -256,4 +256,4 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             )
             # if i == self.backbone_layer:
                 # backbone_hs = hidden_states
-        return self.norm(hidden_states), None
+        return self.norm(hidden_states), torch.tensor([])
