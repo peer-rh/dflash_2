@@ -24,7 +24,7 @@ from lightning.fabric.utilities import AttributeDict
 from .trees import TreeProcessor
 from .trees.block_tree import BlockTree
 from .trees.fixed_tree_prunable import PrunableTreeProcessor
-# from .trees.tree_v2 import PrunableTreeProcessor
+from .trees.every_branch_tree import EveryBranchTreeProcessor
 from .util import SpecializedDynamicCache, merge_metrics, sample, wall_time
 from .data.data_module import DataModule, DataModuleConfig
 from .models.dflash import DFlashDraftModel
@@ -137,6 +137,7 @@ class Trainer:
         # if self.config.compile:
             # self.target = torch.compile(self.target, dynamic=True)
         self.target = self.fabric.to_device(self.target)
+        self.step = 0
 
         if tree_type == "fixed":
             self.tree_processor = PrunableTreeProcessor(**tree_args, n_candidate_tokens=None, mask_token_id=self.mask_token_id, device=self.fabric.device)
@@ -144,6 +145,8 @@ class Trainer:
             self.tree_processor = PrunableTreeProcessor(**tree_args, mask_token_id=self.mask_token_id, device=self.fabric.device)
         elif tree_type == "block":
             self.tree_processor = BlockTree(**tree_args, mask_token_id=self.mask_token_id, device=self.fabric.device)
+        elif tree_type == "every_branch":
+            self.tree_processor = EveryBranchTreeProcessor(**tree_args, mask_token_id=self.mask_token_id, device=self.fabric.device)
         else:
             raise ValueError(f"Unsupported tree type: {tree_type}")
 
@@ -471,7 +474,7 @@ class Trainer:
             print("Process_batch")
             print("Tree Labels:",)
             for i in range(tree_labels.shape[2]):
-                print(self.tokenizer.decode(tree_labels[0, 0, tree_extras.tree_info.tree_mask[0, 0, i].bool()]))
+                print(tree_extras.tree_cum_prob[0, 0, i].item(), " - ", self.tokenizer.decode(tree_labels[0, 0, tree_extras.tree_info.tree_mask[0, 0, i].bool()], skip_special_tokens=False))
             print("Tree Preds:", self.tokenizer.decode(tree_logits.argmax(dim=-1)[0, 0]))
             print("Verifier AR Probs:", tree_extras.tree_ar_prob[0, 0])
             print("Verifier Cum Prods: ", tree_extras.tree_cum_prob[0, 0])
@@ -540,6 +543,7 @@ class Trainer:
     def train_step(self, batch, is_accumulating: bool = True):
         self.drafter.train()
         self.target.eval()
+        self.step += 1
         with self.fabric.no_backward_sync(self.drafter, enabled=is_accumulating): # type: ignore
             loss, metrics = self._train_inner(batch)
         if not is_accumulating:
@@ -765,6 +769,7 @@ class Trainer:
             "sibling_overlap_loss": reduced_metrics['sibling_overlap_loss_sum'] / reduced_metrics['token_count'],
             "total_accuracy": reduced_metrics['token_correct_count'] / reduced_metrics['token_count'], 
             "accepted_length": reduced_metrics['accepted_length_sum'] / reduced_metrics['block_count'],
+            "step": self.step,
         }
         if reduced_metrics['sibling_pair_count'] > 0:
             metrics["sibling_argmax_collision_rate"] = (

@@ -13,20 +13,19 @@ class EveryBranchTreeProcessor(TreeProcessor):
     def __init__(
         self,
         depth: int,
-        edges: Sequence[tuple[int, int]],
-        top_K: Sequence[int],
         n_candidate_tokens: int | None,
         n_compute_branches: int,
         mask_token_id: int,
         device: torch.device,
     ) -> None:
         super().__init__()
+        edges = [(0, 1), (0, 2), (0, 3), (1, 4), (1, 5), (2, 6), (2, 7)]
+        top_K = [0, 1, 2, 3, 0, 1, 0, 1]
         self.n_candidate_tokens = n_candidate_tokens
         self.n_compute_branches = n_compute_branches
         self.depth = depth
         self.MASK_TOKEN_ID = mask_token_id
         self.top_k = torch.tensor(top_K, device=device)
-        # block is [DIST_0, DIST_1, DIST_2, ...]
 
         self.tree_size = depth * (len(edges) + 1)
         self.full_tree_mask = torch.zeros((self.tree_size, self.tree_size), dtype=torch.bool, device=device)
@@ -34,6 +33,7 @@ class EveryBranchTreeProcessor(TreeProcessor):
         self.single_branch_mask = torch.zeros((len(edges)+1, len(edges)+1), dtype=torch.bool, device=device)
         self.parent_idx = torch.full((self.tree_size,), -1, dtype=torch.long, device=device)
         self.is_leaf = torch.ones((self.tree_size,), dtype=torch.bool, device=device)
+        self.single_parent_idx = torch.full((len(edges)+1,), -1, dtype=torch.long, device=device)
 
 
         self.full_tree_mask[:self.depth, :self.depth] = torch.tril(torch.ones((self.depth, self.depth), dtype=torch.bool, device=device))
@@ -46,6 +46,7 @@ class EveryBranchTreeProcessor(TreeProcessor):
             self.parent_idx[child*self.depth : (1+child)*self.depth] = parent*self.depth + torch.arange(self.depth, device=device)
             self.single_branch_mask[child] = self.single_branch_mask[parent]
             self.single_branch_mask[child, child] = True
+            self.single_parent_idx[child] = parent
         
         self.seq_positions = self.full_tree_mask.sum(dim=-1) - 1
         self.single_dist_to_left_most = self.single_branch_mask.sum(dim=-1) - 1
@@ -185,11 +186,9 @@ class EveryBranchTreeProcessor(TreeProcessor):
             device=input_ids.device,
         )
 
-        TS_MOD = self.n_compute_branches * self.requires_extra_attention.sum().item()
-
         past_key_values = StaticCache(
             config=target.config,
-            max_cache_len=S + N_B * TS_MOD,
+            max_cache_len=S + self.n_compute_branches,
         )
         prefill_cache_position = torch.arange(S, device=input_ids.device)
 
@@ -205,10 +204,13 @@ class EveryBranchTreeProcessor(TreeProcessor):
         target_hidden_states = prefill_out.hidden_states
         logits = prefill_out.logits
 
-        tree_labels = torch.zeros(
-            (B, N_B, self.tree_size), dtype=torch.long, device=input_ids.device
+        tree_labels = torch.full(
+            (B, N_B, self.tree_size), self.MASK_TOKEN_ID, dtype=torch.long, device=input_ids.device
         )
-        tree_ar_prob = torch.zeros(
+        tree_ar_prob = torch.ones(
+            (B, N_B, self.tree_size), dtype=logits.dtype, device=input_ids.device
+        )
+        tree_cum_prob = torch.ones(
             (B, N_B, self.tree_size), dtype=logits.dtype, device=input_ids.device
         )
         tree_ar_prob[:, :, 0] = 1.0
@@ -216,33 +218,43 @@ class EveryBranchTreeProcessor(TreeProcessor):
         physical_position_ids = torch.arange(self.depth, device=input_ids.device)[None, None, :] + anchors[:, :, None]
         tree_labels[:, :, :self.depth] = torch.gather(input_ids, 1, physical_position_ids.view(B, -1)).view(B, N_B, -1)
 
-        d_0_logits = torch.gather(
-            logits, 1, physical_position_ids.view(B, -1).expand(-1, -1, logits.shape[-1])
+        d_0_probs = torch.gather(
+            logits, 1, physical_position_ids.view(B, -1, 1).expand(-1, -1, logits.shape[-1])
         ).view(B, N_B, self.depth, -1).softmax(dim=-1) # [B, N_B, depth, vocab_size]
         tree_ar_prob[:, :, 1:self.depth] = torch.gather(
-            d_0_logits[:, :, :-1], 3, tree_labels[:, :, 1:self.depth, None]
-        ).squeeze(-1).detach() # [B, N_B, depth-1
-        d_0_logits[:, :, :-1].scatter_(3, tree_labels[:, :, 1:self.depth, None], -torch.inf) # Should not be picked
-        d_0_logits_top_k = torch.topk(d_0_logits[:, :, :-1], k=8, dim=-1) # [B, N_B, depth-1, topk]
+            d_0_probs[:, :, :-1], 3, tree_labels[:, :, 1:self.depth, None]
+        ).squeeze(-1).detach() 
+        tree_cum_prob[:, :, :self.depth] = torch.where(
+            self.full_tree_mask[:self.depth, :self.depth], tree_ar_prob[:, :, None, :self.depth], 1.0
+        ).prod(dim=-1) 
+        d_0_probs[:, :, :-1].scatter_(3, tree_labels[:, :, 1:self.depth, None], -torch.inf) # Should not be picked
+        d_0_probs_top_k = torch.topk(d_0_probs, k=8, dim=-1) # [B, N_B, depth-1, topk]
         for i in torch.nonzero(self.single_dist_to_left_most == 1, as_tuple=True)[0]:
             k = self.top_k[i].long()
-            tree_labels[:, :, i*self.depth:(1+i)*self.depth] = d_0_logits_top_k.indices[:, :, :, k]
-            tree_ar_prob[:, :, i*self.depth:(1+i)*self.depth] = d_0_logits_top_k.values[:, :, :, k].detach()
+            tree_labels[:, :, i*self.depth:(1+i)*self.depth] = d_0_probs_top_k.indices[:, :, :, k]
+            tree_ar_prob[:, :, i*self.depth:(1+i)*self.depth] = d_0_probs_top_k.values[:, :, :, k].detach()
+            tree_cum_prob[:, :, i*self.depth:(1+i)*self.depth] = tree_ar_prob[:, :, i*self.depth:(1+i)*self.depth] * tree_cum_prob[:, :, :self.depth] 
         
         # Compute cum prod for each vertex, which would require attention
-        # Only keep the top n_compute_branchea
-        compute_blocks= ... # [B, n_compute_branches]
-        compute_vertex_idx = ... # [B, n_compute_branches]
-
-        # Now run for each of these and keep the rest as masked
+        # Only keep the top n_compute_branches
+        candidates = torch.where(
+            ~self.is_leaf[None, None, self.depth:],
+            tree_cum_prob[:, :, self.depth:],
+            0.0
+        ).view(B, -1).topk(self.n_compute_branches)
+        print(candidates.indices)
+        compute_blocks = candidates.indices // (self.tree_size - self.depth)
+        compute_vertex_idx = candidates.indices % (self.tree_size - self.depth)
 
         def mask_mod(B, _H, Q, KV):
-            q_block = Q % N_B
-            k_block = (KV - S) % N_B
-            q_tree_pos = Q // N_B % TS_MOD
-            k_tree_pos = (KV - S) // N_B % TS_MOD
+            q_block = compute_blocks[B, Q]
+            q_vertex_idx = compute_vertex_idx[B, Q]
+            q_depth = q_vertex_idx % self.depth
+            kv_safe = (KV - S) % self.n_compute_branches
+            kv_block = compute_blocks[B, kv_safe]
+            kv_vertex_idx = compute_vertex_idx[B, kv_safe]
             is_ctxt = KV < S
-            is_causal = KV < anchors[B, q_block] + self.left_most_ancestors[q_tree_pos]
+            is_causal = (KV <= anchors[B, q_block] + q_depth)
             same_doc = True
             if document_masks is None:
                 same_doc = True
@@ -251,73 +263,46 @@ class EveryBranchTreeProcessor(TreeProcessor):
                     document_masks[B, KV % S] == document_masks[B, anchors[B, q_block]]
                 )
             ctxt_part = is_ctxt & is_causal & same_doc
-            is_ancestor = self.no_leaf_no_left_mask[q_tree_pos, k_tree_pos]
-            tree_part = ~is_ctxt & (q_block == k_block) & is_ancestor
-            return ctxt_part | tree_part
+            return ctxt_part | (~is_ctxt & (q_block == kv_block) & (kv_vertex_idx == q_vertex_idx))
 
         tree_gen_block_mask = create_block_mask(
             mask_mod,
             B=B,
             H=None,
-            Q_LEN=N_B * TS_MOD,
-            KV_LEN=S + N_B * TS_MOD,
+            Q_LEN=self.n_compute_branches,
+            KV_LEN=S + self.n_compute_branches,
             device=input_ids.device,
         )
 
-        curr_cache_pos = S
-        while next_input_idx.size(0) > 0:
-            position_ids = (
-                (
-                    self.seq_positions[next_input_idx][None, None, :]
-                    + anchors[:, :, None]
-                )
-                .transpose(1, 2)
-                .reshape(B, -1)
-            )  # [B, width * N_NB]
-            input_ids = (
-                tree_labels[:, :, next_input_idx].transpose(1, 2).reshape(B, -1)
-            )  # [B, width * N_B]
-            start_idx = next_input_idx.min().item()
-            end_idx = next_input_idx.max().item() + 1
-            block_index = (start_idx * N_B) // tree_gen_block_mask.BLOCK_SIZE[0]
-            block_end = (end_idx * N_B) // tree_gen_block_mask.BLOCK_SIZE[0]
-            this_mask = tree_gen_block_mask[:, :, block_index:block_end]
-            this_mask.mask_mod = get_mask_mod_w_offset(
-                this_mask.mask_mod, _offset=start_idx * N_B
-            )
-            outputs = target(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                use_cache=True,
-                past_key_values=past_key_values,
-                cache_position=(
-                    curr_cache_pos + torch.arange(input_ids.shape[1], device=input_ids.device)
-                ),
-                attn_mask=this_mask,
-            )
-            curr_cache_pos += input_ids.shape[1]
-            this_logits = outputs.logits.view(B, -1, N_B, logits.shape[-1]).transpose(
-                1, 2
-            )  # [B, N_B, width, vocab_size]
-            this_probs = F.softmax(this_logits, dim=-1)
-            this_probs_topk = torch.topk(this_probs, k=8, dim=-1) # [B, N_B, width, topk]
-            all_children = torch.zeros(
-                (self.tree_size), dtype=torch.bool, device=input_ids.device
-            )
-            # is_any_child = (self.parent[None, :] == next_input_idx[:, None]).any(dim=0)
-            for i, par in enumerate(next_input_idx):
-                children = self.parent_idx == par
-                tree_labels[:, :, children] = this_probs_topk.indices[
-                    :, :, i, self.top_k[children]
-                ]
-                tree_ar_prob[:, :, children] = this_probs_topk.values[
-                    :, :, i, self.top_k[children]
-                ].detach()
-                all_children[children] = True
-            next_input_idx = torch.nonzero(all_children & ~self.is_leaf, as_tuple=True)[
-                0
-            ]
+        anchored_position_ids = torch.gather(position_ids, 1, anchors) # [B, N_B]
+        position_ids = self.seq_positions.gather(0, compute_vertex_idx.view(-1)).view(B, -1) + anchored_position_ids.gather(1, compute_blocks)
+        input_ids = tree_labels[torch.arange(B, device=input_ids.device)[:, None].expand(B, self.n_compute_branches), compute_blocks, compute_vertex_idx] # [B, n_compute_branches]
 
+        curr_cache_pos = S
+        outputs = target(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            use_cache=True,
+            past_key_values=past_key_values,
+            cache_position=(
+                curr_cache_pos + torch.arange(input_ids.shape[1], device=input_ids.device)
+            ),
+            attn_mask=tree_gen_block_mask,
+        )
+        logits = outputs.logits
+        probs = F.softmax(logits, dim=-1)
+        top_k = torch.topk(probs, k=8, dim=-1)
+        topk_probs_full = torch.ones((B, N_B, self.tree_size, 8), device=input_ids.device, dtype=probs.dtype)
+        topk_indices_full = torch.full((B, N_B, self.tree_size, 8), self.MASK_TOKEN_ID, device=input_ids.device, dtype=torch.long)
+        topk_probs_full[torch.arange(B)[:, None].expand(B, self.n_compute_branches), compute_blocks, compute_vertex_idx] = top_k.values.detach()
+        topk_indices_full[torch.arange(B)[:, None].expand(B, self.n_compute_branches), compute_blocks, compute_vertex_idx] = top_k.indices
+
+        for i in torch.nonzero(self.single_dist_to_left_most == 2, as_tuple=True)[0]:
+            k = self.top_k[i].long()
+            parents = self.parent_idx[i*self.depth:(1+i)*self.depth] # [depth]
+            tree_labels[:, :, i*self.depth:(1+i)*self.depth] = topk_indices_full[:, :, parents, k]
+            tree_ar_prob[:, :, i*self.depth:(1+i)*self.depth] = topk_probs_full[:, :, parents, k].detach()
+        
         tree_cum_prob = torch.where(
             self.full_tree_mask, tree_ar_prob[:, :, None, :], 1.0
         ).prod(dim=-1) # [B, N_B, T]

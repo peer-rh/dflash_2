@@ -81,17 +81,16 @@ MODEL_JSON=$(cat <<EOF
   "vocab_size": 151936,
   "use_tree_pos_emb": true,
   "use_additive_tree_pos_bias": true,
-  "max_tree_size": 32,
+  "max_tree_size": 128,
   "use_q_head": false
 }
 EOF
 )
 TREE_JSON=$(cat <<EOF
 {
-    "paths": [[0], [0, 1], [0, 1, 2], [0, 1, 2, 3], [0, 1, 2, 3, 4], [0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5, 6], [0, 1, 2, 3, 4, 5, 6, 7], [0, 1, 2, 3, 4, 5, 6, 7, 8], [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], [0, 10], [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11], [0, 1, 12], [0, 10, 13], [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 14], [0, 15], [0, 16], [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 14, 17], [0, 1, 2, 18], [0, 1, 12, 19], [0, 10, 13, 20], [0, 1, 21], [0, 15, 22], [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 14, 17, 23], [0, 1, 24], [0, 16, 25], [0, 1, 21, 26], [0, 1, 2, 27], [0, 15, 22, 28], [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 14, 17, 23, 29], [0, 1, 2, 30], [0, 1, 24, 31]],
-    "top_k": [-1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 3, 0, 1, 0, 0, 2, 0, 0, 3, 0, 0, 2, 0, 0, 3, 0],
-    "left_most_idx": 29,
-    "n_candidate_tokens": null
+    "depth": 16,
+    "n_candidate_tokens": null,
+    "n_compute_branches": 16
 }
 EOF
 )
@@ -102,5 +101,5 @@ uv run -m src.trainer --run_name $EXPERIMENT_NAME --seed 42 --trainer.compile fa
     --data.data_path ../dflash/datasets/qwen3-4b/ \
     --data.batch_size 2 --data.seq_len 3072 --data.n_blocks 64 --data.block_size 24 \
     --data.num_workers 4 --trainer.checkpoint_path $checkpoint_path \
-    --trainer.grad_accum_steps 4 --trainer.log_every 10 --trainer.num_epochs 8  --trainer.eval_every 2048 --trainer.save_every 2048 \
-    --tree_type prunable --tree_args "$TREE_JSON" --trainer.ddp false --trainer.precision 'bf16-true'   --trainer.loss_weighting "target_probs"
+    --trainer.grad_accum_steps 6 --trainer.log_every 10 --trainer.num_epochs 8  --trainer.eval_every 2048 --trainer.save_every 2048 \
+    --tree_type every_branch --tree_args "$TREE_JSON" --trainer.ddp false --trainer.precision 'bf16-true'   --trainer.loss_weighting "target_probs"
