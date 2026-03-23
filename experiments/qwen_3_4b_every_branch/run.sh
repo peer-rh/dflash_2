@@ -86,7 +86,7 @@ MODEL_JSON=$(cat <<MODELEOF
   "use_tree_pos_emb": true,
   "use_additive_tree_pos_bias": true,
   "max_tree_size": 128,
-  "use_q_head": true,
+  "use_q_head": true
 }
 MODELEOF
 )
