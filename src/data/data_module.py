@@ -35,11 +35,14 @@ def setup_synthetic_dataset(
     tokenizer, data_path, seq_len, block_size, num_workers, seed, n_validation
 ):
     datafiles = []
-    for i in os.listdir(data_path):
-        if i.endswith(".jsonl"):
-            datafiles.append(os.path.join(data_path, i))
-    dataset = load_dataset("json", data_files=datafiles)
-    dataset = dataset["train"]
+    if data_path.startswith("."):
+        for i in os.listdir(data_path):
+            if i.endswith(".jsonl"):
+                datafiles.append(os.path.join(data_path, i))
+        dataset = load_dataset("json", data_files=datafiles)
+        dataset = dataset["train"]
+    else:
+        dataset = load_dataset(data_path, split="train")
 
     print(f"Loaded synthetic dataset with {len(dataset)} samples. Processing...")
     FLEX_BS = 128

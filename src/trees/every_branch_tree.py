@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask
 from transformers.cache_utils import StaticCache
 
-from . import DESCENDANT_RELATION, TreeInfo, TreeProcessor, CandidateExtras, InferenceExtras, TrainingExtras, CHILD_RELATION, ANCESTOR_RELATION, IS_SELF_RELATION, PARENT_RELATION, expand_tree_info
+from . import DESCENDANT_RELATION, TreeInfo, TreeProcessor, CandidateExtras, InferenceExtras, TrainingExtras, CHILD_RELATION, ANCESTOR_RELATION, IS_SELF_RELATION, PARENT_RELATION, expand_tree_info, UNRELATED_RELATION, SIBLING_RELATION
 from ..util import get_mask_mod_w_offset
 
 
@@ -52,12 +52,19 @@ class EveryBranchTreeProcessor(TreeProcessor):
         self.single_dist_to_left_most = self.single_branch_mask.sum(dim=-1) - 1
         self.requires_extra_attention = ~self.is_leaf
         self.requires_extra_attention[:self.depth] = False
+
+        child_relations = torch.tensor(CHILD_RELATION, device=device)
+        sibling_relations = torch.tensor(SIBLING_RELATION, device=device)
         
-        relation_map = torch.zeros((self.tree_size, self.tree_size), dtype=torch.long, device=device)
+        relation_map = torch.full((self.tree_size, self.tree_size), UNRELATED_RELATION, dtype=torch.long, device=device)
         relation_map[self.full_tree_mask] = ANCESTOR_RELATION
         relation_map[self.full_tree_mask.T] = DESCENDANT_RELATION
         relation_map[self.parent_idx[:, None] == torch.arange(self.tree_size, device=device)[None, :]] = PARENT_RELATION
-        relation_map[self.parent_idx[None, :] == torch.arange(self.tree_size, device=device)[:, None]] = CHILD_RELATION
+        is_sibling = self.parent_idx[:, None] == self.parent_idx[None, :]
+        top_k_aligned = self.top_k[torch.arange(self.tree_size) // self.depth]
+        relation_map[is_sibling] = sibling_relations[top_k_aligned[:, None] * 4 + top_k_aligned[None, :]][is_sibling]
+        is_child = self.parent_idx[None, :] == torch.arange(self.tree_size, device=device)[:, None]
+        relation_map[is_child] = child_relations[None, top_k_aligned].expand(*is_child.shape)[is_child]
         relation_map[torch.arange(self.tree_size, device=device), torch.arange(self.tree_size, device=device)] = IS_SELF_RELATION
         self.tree_info = TreeInfo(
             tree_mask=self.full_tree_mask,
@@ -242,9 +249,8 @@ class EveryBranchTreeProcessor(TreeProcessor):
             tree_cum_prob[:, :, self.depth:],
             0.0
         ).view(B, -1).topk(self.n_compute_branches)
-        print(candidates.indices)
         compute_blocks = candidates.indices // (self.tree_size - self.depth)
-        compute_vertex_idx = candidates.indices % (self.tree_size - self.depth)
+        compute_vertex_idx = candidates.indices % (self.tree_size - self.depth) + self.depth
 
         def mask_mod(B, _H, Q, KV):
             q_block = compute_blocks[B, Q]

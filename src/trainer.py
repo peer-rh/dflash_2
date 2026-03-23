@@ -95,7 +95,7 @@ class Trainer:
         self.quality_loaders = dict(zip(quality_loaders.keys(), quality_loaders_fabric))
 
         self.steps_per_epoch = (
-            len(self.trainloader) // self.fabric.world_size // config.grad_accum_steps
+            len(self.trainloader) // config.grad_accum_steps
         )
         self.total_steps = self.steps_per_epoch * config.num_epochs
         self.tokenizer = AutoTokenizer.from_pretrained(target)
@@ -474,7 +474,7 @@ class Trainer:
             print("Process_batch")
             print("Tree Labels:",)
             for i in range(tree_labels.shape[2]):
-                print(tree_extras.tree_cum_prob[0, 0, i].item(), " - ", self.tokenizer.decode(tree_labels[0, 0, tree_extras.tree_info.tree_mask[0, 0, i].bool()], skip_special_tokens=False))
+                print(tree_extras.tree_cum_prob[0, 0, i].item(), " - ", self.tokenizer.decode(tree_labels[0, 0, tree_extras.tree_info.tree_mask[0, 0, i].bool()], skip_special_tokens=False).replace("\n", "\\n"))
             print("Tree Preds:", self.tokenizer.decode(tree_logits.argmax(dim=-1)[0, 0]))
             print("Verifier AR Probs:", tree_extras.tree_ar_prob[0, 0])
             print("Verifier Cum Prods: ", tree_extras.tree_cum_prob[0, 0])

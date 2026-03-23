@@ -17,7 +17,7 @@ class BlockTree(TreeProcessor):
         relation_map = torch.zeros((block_size, block_size), dtype=torch.long, device=device)
         relation_map[depth[None, :] < depth[:, None]] = DESCENDANT_RELATION
         relation_map[depth[None, :] > depth[:, None]] = ANCESTOR_RELATION
-        relation_map[depth[None, :] == depth[:, None] + 1] = CHILD_RELATION
+        relation_map[depth[None, :] == depth[:, None] + 1] = CHILD_RELATION[0]
         relation_map[depth[None, :] + 1 == depth[:, None] + 1] = PARENT_RELATION
         relation_map[depth[None, :] == depth[:, None]] = IS_SELF_RELATION
         self.tree_info = TreeInfo(

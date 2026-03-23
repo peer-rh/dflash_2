@@ -12,12 +12,13 @@ class TreeInfo:
     tree_position_ids: torch.Tensor # [..., T]
 
 UNRELATED_RELATION = 0
-SIBLING_RELATION = 1
-PARENT_RELATION = 2
-CHILD_RELATION = 3
-DESCENDANT_RELATION = 4
-ANCESTOR_RELATION = 5
-IS_SELF_RELATION = 6
+PARENT_RELATION = 1
+DESCENDANT_RELATION = 2
+ANCESTOR_RELATION = 3
+IS_SELF_RELATION = 4
+CHILD_RELATION = [6, 7, 8, 9]
+SIBLING_RELATION = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]
+
 
 
 def expand_tree_info(tree_info: TreeInfo, target_shape: tuple[int, ...]) -> TreeInfo:

@@ -28,7 +28,7 @@ cd $DIRECTORY
 checkpoint_path="$OUTPUT_DIR/checkpoints"
 mkdir -p $checkpoint_path
 
-TARGET_MODEL="Qwen/Qwen3-4B"
+TARGET_MODEL="Qwen/Qwen3-0.6B"
 MODEL_JSON=$(cat <<EOF
 {
   "architectures": [
@@ -45,19 +45,19 @@ MODEL_JSON=$(cat <<EOF
     "mask_token_id": 151669,
     "target_layer_ids": [
       1,
+      5,
       9,
       17,
-      25,
-      33
+      25
     ]
   },
   "dtype": "bfloat16",
   "eos_token_id": 151645,
   "head_dim": 128,
   "hidden_act": "silu",
-  "hidden_size": 2560,
+  "hidden_size": 1024,
   "initializer_range": 0.02,
-  "intermediate_size": 9728,
+  "intermediate_size": 3072,
   "layer_types": [
     "full_attention",
     "full_attention",
@@ -99,7 +99,7 @@ uv run -m src.trainer --run_name $EXPERIMENT_NAME --seed 42 --trainer.compile tr
     --drafter "$MODEL_JSON" \
     --target $TARGET_MODEL \
     --data.data_path ../dflash/datasets/qwen3-4b/ \
-    --data.batch_size 1 --data.seq_len 3072 --data.n_blocks 64 --data.block_size 24 \
+    --data.batch_size 4 --data.seq_len 3072 --data.n_blocks 64 --data.block_size 24 \
     --data.num_workers 4 --trainer.checkpoint_path $checkpoint_path \
     --trainer.grad_accum_steps 12 --trainer.log_every 10 --trainer.num_epochs 8  --trainer.eval_every 2048 --trainer.save_every 2048 \
     --tree_type every_branch --tree_args "$TREE_JSON" --trainer.ddp false --trainer.precision 'bf16-true'   --trainer.loss_weighting "target_probs" --trainer.ddp true
