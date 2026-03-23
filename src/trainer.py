@@ -52,6 +52,8 @@ class TrainerConfig:
     sibling_overlap_loss_weight: float = 0.0
     sibling_overlap_temperature: float = 0.5
     sibling_overlap_topk: int = 8
+    devices: int = 1
+
 
 
 class Trainer:
@@ -71,6 +73,8 @@ class Trainer:
             precision=config.precision, # type: ignore
             strategy="ddp" if config.ddp else 'auto',
             loggers=logger,
+	    devices=config.devices
+
         )
         self.fabric.launch()
         self.wandb = logger

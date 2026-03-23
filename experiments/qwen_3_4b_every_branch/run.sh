@@ -5,8 +5,8 @@
 #SBATCH --mem=48G
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=4
-#SBATCH --gres=gpu:1
 #SBATCH --time=0-08:00:00
+#SBATCH --gpus-per-task=1
 #CommentSBATCH --gpus-per-task=1
 #CommentSBATCH --nodelist=tikgpu08 # Specify that it should run on this particular node
 #CommentSBATCH --account=tik-internal
@@ -106,5 +106,5 @@ python -m src.trainer --run_name $EXPERIMENT_NAME --seed 42 --trainer.compile tr
     --data.batch_size 12 --data.seq_len 3072 --data.n_blocks 64 --data.block_size 24 \
     --data.num_workers 6 --trainer.checkpoint_path $checkpoint_path \
     --trainer.grad_accum_steps 4 --trainer.log_every 10 --trainer.num_epochs 8  --trainer.eval_every 2048 --trainer.save_every 2048 \
-    --tree_type every_branch --tree_args "$TREE_JSON" --trainer.ddp false --trainer.precision 'bf16-true'   --trainer.loss_weighting "target_probs"
+    --tree_type every_branch --tree_args "$TREE_JSON" --trainer.ddp false --trainer.precision 'bf16-true'   --trainer.loss_weighting "target_probs" --trainer.devices 1
 EOF
