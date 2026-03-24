@@ -82,6 +82,7 @@ class SpecializedDynamicCacheLayer(DynamicLayer):
             self.values = torch.cat([self.values[:, :, :self.seq_end], value_states], dim=-2)
         
         self.seq_end = self.keys.shape[2]
+        self.idx_to_keep = None
         return self.keys, self.values
 
 

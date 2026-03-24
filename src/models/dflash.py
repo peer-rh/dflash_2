@@ -118,6 +118,7 @@ class Qwen3DFlashAttention(nn.Module):
                 is_tree = KV >= total_ctx_len
                 bias_ = bias[B, Q_TREE, Q_TREE_POS, KV_TREE_POS, H] * same_tree * is_tree
                 score = exitsing_score_mod(score + bias_, B, H, Q, KV)
+                return score
 
         attn_output, attn_weights = attn_fn(
             self,

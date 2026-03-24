@@ -264,6 +264,7 @@ class Trainer:
 
     @torch.inference_mode()
     def validate(self):
+        print("Running validation...")
         self.target.eval()
         self.drafter.eval()
         metrics = None
@@ -277,6 +278,7 @@ class Trainer:
 
     @torch.inference_mode()
     def validate_quality(self):
+        print("Running quality validation...")
         self.target.eval()
         self.drafter.eval()
         for split_name, loader in self.quality_loaders.items():
@@ -569,6 +571,8 @@ class Trainer:
             input_ids: [1, S]
             max_length: int
         """
+        self.drafter.eval()
+        self.target.eval()
         num_input_tokens = input_ids.shape[1]
         output_ids = torch.zeros(
             (1, num_input_tokens + max_length + 128),
