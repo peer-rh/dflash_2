@@ -87,6 +87,10 @@ The drafter processes the full tree in one forward pass using tree-causal attent
 L_lm = CrossEntropy(tree_logits, tree_labels[:, :, 1:])
 ```
 
+During training, the `lm_head` projection and CE can optionally be computed in chunks over
+flattened prediction positions via `trainer.ce_chunk_size`. This preserves the loss exactly
+while avoiding materializing the full `[B, N_T, T-1, V]` logits tensor at once.
+
 When `loss_weighting="target_probs"`, each token's loss is scaled by the target model's cumulative probability of reaching that node:
 
 ```
@@ -195,6 +199,7 @@ acceptance_length = depth[best_vertex]
 | `depth` | — | Tree depth; total tree size = `8 × depth` |
 | `n_candidate_tokens` | `None` | Max candidates sent to verifier; `None` = full tree |
 | `loss_weighting` | `None` | `"target_probs"` to weight loss by path probability |
+| `ce_chunk_size` | `None` | Number of prediction positions per LM-head / CE chunk during training |
 | `sibling_overlap_loss_weight` | `0.0` | Diversity regularization weight |
 | `sibling_overlap_temperature` | `0.5` | Softmax temperature for overlap computation |
 | `sibling_overlap_topk` | `8` | Top-k predictions considered per node |

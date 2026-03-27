@@ -54,6 +54,7 @@ class TrainerConfig:
     sibling_overlap_topk: int = 8
     devices: int = 1
     anchor_chunk_size: int | None = None
+    ce_chunk_size: int | None = None
 
 
 
@@ -163,6 +164,8 @@ class Trainer:
                     f"`trainer.anchor_chunk_size` is only supported for BlockTree or "
                     f"EveryBranchTreeProcessor with offline labels; got tree_type={tree_type}."
                 )
+        if self.config.ce_chunk_size is not None and self.config.ce_chunk_size <= 0:
+            raise ValueError("`trainer.ce_chunk_size` must be greater than 0 when set.")
 
         parent_idx = self.tree_processor.get_parent_idx()[1:]
         same_parent = parent_idx[:, None] == parent_idx[None, :]
@@ -185,20 +188,20 @@ class Trainer:
             self.process_batch = torch.compile(self.process_batch)
             self._train_inner = torch.compile(self._train_inner)
 
-    def _compute_sibling_overlap_loss(self, tree_logits: torch.Tensor) -> torch.Tensor:
+    def _compute_sibling_overlap_loss(
+        self,
+        top_idx: torch.Tensor,
+        top_vals: torch.Tensor,
+    ) -> torch.Tensor:
         if (
             not self.config.sibling_overlap_loss_enabled
             or self.config.sibling_overlap_loss_weight == 0.0
             or self.num_sibling_pairs == 0
         ):
-            return tree_logits.new_zeros(())
+            return top_vals.new_zeros(())
+        if top_vals.size(-1) <= 0:
+            return top_vals.new_zeros(())
 
-        topk = min(self.config.sibling_overlap_topk, tree_logits.size(-1))
-        if topk <= 0:
-            return tree_logits.new_zeros(())
-
-        temperature = max(self.config.sibling_overlap_temperature, 1e-6)
-        top_vals, top_idx = torch.topk(tree_logits / temperature, k=topk, dim=-1)
         top_probs = F.softmax(top_vals, dim=-1)
 
         idx_i = top_idx[:, :, self.sibling_pair_i]
@@ -214,7 +217,7 @@ class Trainer:
         ).sum(dim=(-1, -2))
 
         block_overlap = pair_overlap.mean(dim=-1)
-        return block_overlap.sum() * tree_logits.shape[2]
+        return block_overlap.sum() * top_idx.shape[2]
 
     def _get_anchor_chunk_size(self, n_trees: int) -> int | None:
         anchor_chunk_size = getattr(self.config, "anchor_chunk_size", None)
@@ -232,6 +235,16 @@ class Trainer:
         if anchor_chunk_size >= n_trees:
             return None
         return anchor_chunk_size
+
+    def _get_ce_chunk_size(self, n_positions: int) -> int | None:
+        ce_chunk_size = getattr(self.config, "ce_chunk_size", None)
+        if ce_chunk_size is None:
+            return None
+        if ce_chunk_size <= 0:
+            raise ValueError("`trainer.ce_chunk_size` must be greater than 0 when set.")
+        if ce_chunk_size >= n_positions:
+            return None
+        return ce_chunk_size
 
     def _slice_tree_info(self, tree_info: TreeInfo, start_idx: int, end_idx: int) -> TreeInfo:
         return TreeInfo(
@@ -356,21 +369,103 @@ class Trainer:
             position_ids=drafter_position_ids,
             tree_info=tree_extras.tree_info,
         )
-        tree_logits = self.lm_head(tree_hs.view(B, N_T, T, -1)[:, :, 1:]) # [B, N_T, T-1, N_VOCAB]
-        sibling_overlap_loss = self._compute_sibling_overlap_loss(tree_logits)
+        pred_hidden_states = tree_hs.view(B, N_T, T, -1)[:, :, 1:]
+        flat_hidden_states = pred_hidden_states.reshape(B * N_T * (T - 1), -1)
+        flat_labels = tree_labels[:, :, 1:].reshape(-1)
+        ce_chunk_size = self._get_ce_chunk_size(flat_labels.shape[0]) or flat_labels.shape[0]
 
-        lm_loss = F.cross_entropy(
-            tree_logits.view(-1, tree_logits.size(-1)), tree_labels[:, :, 1:].reshape(-1), reduction="none"
-        ).view(B, N_T, T-1) # [B, N_T, T]
-        if self.config.loss_weighting is None:
-            lm_loss = lm_loss.sum()
-        elif self.config.loss_weighting == "target_probs":
+        flat_weights = None
+        if self.config.loss_weighting == "target_probs":
             with torch.no_grad():
                 cum_prod = tree_extras.tree_cum_prob[:, :, 1:].detach()
-                w = cum_prod / cum_prod.sum(dim=-1, keepdim=True).clamp(min=1e-8) * (T-1)
-                w = w.detach().clone()
+                weights = cum_prod / cum_prod.sum(dim=-1, keepdim=True).clamp(min=1e-8) * (T - 1)
+                flat_weights = weights.reshape(-1).detach().clone()
 
-            lm_loss = (lm_loss * w).sum()
+        needs_sibling_topk = (
+            self.config.sibling_overlap_loss_enabled
+            and self.config.sibling_overlap_loss_weight != 0.0
+            and self.num_sibling_pairs > 0
+        )
+        sibling_topk = 0
+        flat_sibling_top_idx = None
+        flat_sibling_top_vals = None
+        flat_q_values = None
+        if self.drafter.config.use_q_head:
+            flat_q_values = torch.empty(
+                flat_labels.shape[0],
+                device=flat_hidden_states.device,
+                dtype=self.drafter.q_head.weight.dtype, # type: ignore[union-attr]
+            )
+
+        flat_pred_ids = torch.empty_like(flat_labels)
+        lm_loss = torch.zeros((), device=flat_hidden_states.device, dtype=torch.float32)
+        q_loss = torch.zeros((), device=flat_hidden_states.device, dtype=torch.float32)
+
+        for start_idx in range(0, flat_labels.shape[0], ce_chunk_size):
+            end_idx = min(start_idx + ce_chunk_size, flat_labels.shape[0])
+            hidden_chunk = flat_hidden_states[start_idx:end_idx]
+            labels_chunk = flat_labels[start_idx:end_idx]
+            logits_chunk = self.lm_head(hidden_chunk)
+
+            ce_chunk = F.cross_entropy(logits_chunk, labels_chunk, reduction="none")
+            if flat_weights is None:
+                lm_loss = lm_loss + ce_chunk.sum()
+            else:
+                lm_loss = lm_loss + (ce_chunk * flat_weights[start_idx:end_idx]).sum()
+
+            pred_chunk = logits_chunk.argmax(dim=-1)
+            flat_pred_ids[start_idx:end_idx] = pred_chunk
+
+            if needs_sibling_topk:
+                if flat_sibling_top_idx is None or flat_sibling_top_vals is None:
+                    sibling_topk = min(self.config.sibling_overlap_topk, logits_chunk.size(-1))
+                    if sibling_topk > 0:
+                        flat_sibling_top_idx = torch.empty(
+                            flat_labels.shape[0],
+                            sibling_topk,
+                            device=flat_hidden_states.device,
+                            dtype=torch.long,
+                        )
+                        flat_sibling_top_vals = torch.empty(
+                            flat_labels.shape[0],
+                            sibling_topk,
+                            device=flat_hidden_states.device,
+                            dtype=logits_chunk.dtype,
+                        )
+                if sibling_topk > 0 and flat_sibling_top_idx is not None and flat_sibling_top_vals is not None:
+                    temperature = max(self.config.sibling_overlap_temperature, 1e-6)
+                    top_vals_chunk, top_idx_chunk = torch.topk(
+                        logits_chunk / temperature,
+                        k=sibling_topk,
+                        dim=-1,
+                    )
+                    flat_sibling_top_idx[start_idx:end_idx] = top_idx_chunk
+                    flat_sibling_top_vals[start_idx:end_idx] = top_vals_chunk
+
+            if flat_q_values is not None:
+                q_chunk = self.drafter.q_head( # type: ignore[union-attr]
+                    hidden_chunk.to(self.drafter.q_head.weight.dtype) # type: ignore[union-attr]
+                )[:, 0]
+                flat_q_values[start_idx:end_idx] = q_chunk
+                q_loss = q_loss + F.binary_cross_entropy_with_logits(
+                    q_chunk,
+                    (pred_chunk == labels_chunk).float(),
+                    reduction="sum",
+                )
+
+        pred_ids = flat_pred_ids.view(B, N_T, T - 1)
+        is_correct = pred_ids == tree_labels[:, :, 1:]
+
+        sibling_overlap_loss = flat_hidden_states.new_zeros(())
+        if (
+            sibling_topk > 0
+            and flat_sibling_top_idx is not None
+            and flat_sibling_top_vals is not None
+        ):
+            sibling_overlap_loss = self._compute_sibling_overlap_loss(
+                flat_sibling_top_idx.view(B, N_T, T - 1, sibling_topk),
+                flat_sibling_top_vals.view(B, N_T, T - 1, sibling_topk),
+            )
 
         if self.config.verbose:
             print('--')
@@ -378,13 +473,11 @@ class Trainer:
             print("Tree Labels:",)
             for i in range(tree_labels.shape[2]):
                 print(tree_extras.tree_cum_prob[0, 0, i].item(), " - ", self.tokenizer.decode(tree_labels[0, 0, tree_extras.tree_info.tree_mask[0, 0, i].bool()], skip_special_tokens=False).replace("\n", "\\n"))
-            print("Tree Preds:", self.tokenizer.decode(tree_logits.argmax(dim=-1)[0, 0]))
+            print("Tree Preds:", self.tokenizer.decode(pred_ids[0, 0]))
             print("Verifier AR Probs:", tree_extras.tree_ar_prob[0, 0])
             print("Verifier Cum Prods: ", tree_extras.tree_cum_prob[0, 0])
             print("Loss:", lm_loss.item())
         with torch.no_grad():
-            pred_ids = tree_logits.argmax(dim=-1)
-            is_correct = pred_ids == tree_labels[:, :, 1:] # [B, N_T, T-1]
             sibling_pair_count = B * N_T * self.num_sibling_pairs
             sibling_argmax_collision_count = pred_ids.new_zeros((), dtype=torch.long)
             if self.num_sibling_pairs > 0:
@@ -423,9 +516,8 @@ class Trainer:
             "accepted_length_sum": acceptance_length.sum().detach(),
         }
         total_loss = lm_loss + self.config.sibling_overlap_loss_weight * sibling_overlap_loss
-        if self.drafter.config.use_q_head:
-            q_values = self.drafter.q_head(tree_hs.view(B, N_T, T, -1)[:, :, 1:].to(self.drafter.q_head.weight.dtype))[:, :, :, 0] # type: ignore
-            q_loss = F.binary_cross_entropy_with_logits(q_values.view(-1), is_correct.view(-1).float(), reduction="sum")
+        if flat_q_values is not None:
+            q_values = flat_q_values.view(B, N_T, T - 1)
             total_loss = total_loss + 0.5 * q_loss
             metrics["q_loss_sum"] = q_loss.detach()
             metrics["q_accuracy_count"] = ((q_values > 0) == is_correct).sum().detach()

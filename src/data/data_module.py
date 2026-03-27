@@ -173,6 +173,7 @@ def setup_precomputed_tree_dataset(
     block_size: int,
     seed: int,
     n_validation: int,
+    num_workers: int = 4,
 ) -> tuple[Dataset, Dataset]:
     with h5py.File(precomputed_tree_path, "r") as hf:
         prompt_ids = [np.asarray(ids, dtype=np.int64).tolist() for ids in hf["prompt_ids"]]
@@ -193,18 +194,36 @@ def setup_precomputed_tree_dataset(
                 "`sub_trees_ar_probs` do not match `sequence_offsets[-1]`."
             )
 
-    packed = _pack_token_sequences(
-        prompt_ids,
-        response_ids,
-        seq_len=seq_len,
-        block_size=block_size,
-        pad_token_id=pad_token_id,
-        sequence_indices=list(range(len(prompt_ids))),
+    n_sequences = len(prompt_ids)
+    print(f"Loaded precomputed tree HDF5 with {n_sequences} sequences. Processing...")
+
+    raw_dataset = Dataset.from_dict({
+        "prompt_ids": prompt_ids,
+        "response_ids": response_ids,
+    })
+
+    def pack_batch(batch, indices):
+        return _pack_token_sequences(
+            batch["prompt_ids"],
+            batch["response_ids"],
+            seq_len=seq_len,
+            block_size=block_size,
+            pad_token_id=pad_token_id,
+            sequence_indices=list(indices),
+        )
+
+    dataset = raw_dataset.map(
+        pack_batch,
+        batched=True,
+        batch_size=10_000,
+        with_indices=True,
+        num_proc=num_workers,
+        remove_columns=raw_dataset.column_names,
     )
-    dataset = Dataset.from_dict(packed)
+
     dataset = dataset.shuffle(seed=seed)
     print(
-        f"Loaded precomputed tree dataset with {len(prompt_ids)} sequences and "
+        f"Loaded precomputed tree dataset with {n_sequences} sequences and "
         f"{len(dataset)} packed samples."
     )
     val_dataset = dataset.select(range(min(n_validation, len(dataset))))
@@ -243,6 +262,7 @@ class DataModule:
                 self.config.block_size,
                 self.config.seed,
                 self.config.n_validation_samples,
+                self.config.num_workers,
             )
         else:
             self.train_dataset, self.val_dataset = setup_synthetic_dataset(
