@@ -3,12 +3,15 @@ from types import SimpleNamespace
 
 import h5py
 import numpy as np
+import pytest
 import torch
 
 from src.data.data_module import DataModule, DataModuleConfig, setup_precomputed_tree_dataset
 from src.trainer import Trainer
 from src.trees import TrainingExtras, TreeInfo
+from src.trees.block_tree import BlockTree
 from src.trees.every_branch_tree import EveryBranchTreeProcessor
+from src.trees.fixed_tree_prunable import PrunableTreeProcessor
 
 
 def _create_precomputed_tree_h5(path: Path, tree_size: int = 16) -> tuple[list[list[int]], list[list[int]]]:
@@ -58,6 +61,246 @@ class _FakeTarget:
 
     def get_input_embeddings(self):
         return self.embedding
+
+
+def _bind_trainer_methods(dummy_trainer):
+    for name in [
+        "_compute_sibling_overlap_loss",
+        "_get_anchor_chunk_size",
+        "_get_ce_chunk_size",
+        "_slice_tree_info",
+        "_slice_training_extras",
+        "_build_drafter_attention_mask",
+        "_prepare_batch",
+        "_compute_loss_and_metrics",
+        "_process_prepared_batch",
+        "process_batch",
+    ]:
+        setattr(dummy_trainer, name, getattr(Trainer, name).__get__(dummy_trainer, Trainer))
+    return dummy_trainer
+
+
+class _DummyChunkingTreeProcessor:
+    def __init__(self, n_trees: int = 2, tree_size: int = 2, hidden_size: int = 8, supports_chunking: bool = True):
+        self.n_trees = n_trees
+        self.tree_size = tree_size
+        self.hidden_size = hidden_size
+        self.supports_chunking_flag = supports_chunking
+        self.construct_training_extras_call_count = 0
+        self.anchor_sequence_idx = None
+        self.anchor_response_idx = None
+        tree_mask = torch.tensor([[True, False], [True, True]])
+        self.tree_info = TreeInfo(
+            tree_mask=tree_mask.view(1, 1, tree_size, tree_size).expand(1, n_trees, -1, -1),
+            parent_idx=torch.tensor([-1, 0]).view(1, 1, tree_size).expand(1, n_trees, -1),
+            depth=torch.tensor([0, 1]).view(1, 1, tree_size).expand(1, n_trees, -1),
+            is_leaf=torch.tensor([False, True]).view(1, 1, tree_size).expand(1, n_trees, -1),
+            relation_map=torch.zeros(1, n_trees, tree_size, tree_size, dtype=torch.long),
+            tree_position_ids=torch.arange(tree_size).view(1, 1, tree_size).expand(1, n_trees, -1),
+        )
+
+    def supports_anchor_chunking(self) -> bool:
+        return self.supports_chunking_flag
+
+    def get_parent_idx(self):
+        return torch.tensor([-1, 0])
+
+    def construct_training_extras(
+        self,
+        input_ids,
+        anchors,
+        document_mask,
+        position_ids,
+        target,
+        anchor_sequence_idx=None,
+        anchor_response_idx=None,
+    ):
+        self.construct_training_extras_call_count += 1
+        self.anchor_sequence_idx = anchor_sequence_idx
+        self.anchor_response_idx = anchor_response_idx
+
+        batch_size, n_trees = anchors.shape
+        child_labels = anchors.remainder(self.hidden_size - 1) + 1
+        tree_labels = torch.stack([torch.zeros_like(child_labels), child_labels], dim=-1)
+        noise_embds = torch.zeros(batch_size, n_trees, self.tree_size, self.hidden_size)
+        noise_embds.scatter_(
+            3,
+            child_labels[:, :, None, None].expand(-1, -1, 1, 1),
+            5.0,
+        )
+        sequence_position_ids = anchors[:, :, None] + torch.arange(self.tree_size).view(1, 1, self.tree_size)
+        return TrainingExtras(
+            tree_labels=tree_labels,
+            seq_labels=tree_labels,
+            tree_ar_prob=torch.ones(batch_size, n_trees, self.tree_size),
+            tree_cum_prob=torch.ones(batch_size, n_trees, self.tree_size),
+            noise_embds=noise_embds,
+            sequence_position_ids=sequence_position_ids,
+            target_hidden_states=[torch.zeros(batch_size, input_ids.shape[1], self.hidden_size)],
+            tree_info=TreeInfo(
+                tree_mask=self.tree_info.tree_mask.expand(batch_size, n_trees, -1, -1),
+                parent_idx=self.tree_info.parent_idx.expand(batch_size, n_trees, -1),
+                depth=self.tree_info.depth.expand(batch_size, n_trees, -1),
+                is_leaf=self.tree_info.is_leaf.expand(batch_size, n_trees, -1),
+                relation_map=self.tree_info.relation_map.expand(batch_size, n_trees, -1, -1),
+                tree_position_ids=self.tree_info.tree_position_ids.expand(batch_size, n_trees, -1),
+            ),
+        )
+
+
+class _CountingDrafter:
+    def __init__(self, q_head=None):
+        self.config = SimpleNamespace(use_q_head=q_head is not None)
+        self.forward_call_count = 0
+        self.q_head = q_head
+
+    def extract_ctx_features(self, hidden_states):
+        return hidden_states[0]
+
+    def __call__(self, hidden_states, target_ctx_features, attention_mask, position_ids, tree_info):
+        self.forward_call_count += 1
+        return hidden_states, hidden_states
+
+
+def _make_dummy_trainer(*, anchor_chunk_size=None, n_trees: int = 2, supports_chunking: bool = True):
+    hidden_size = 8
+    tree_processor = _DummyChunkingTreeProcessor(
+        n_trees=n_trees,
+        tree_size=2,
+        hidden_size=hidden_size,
+        supports_chunking=supports_chunking,
+    )
+    dummy_trainer = SimpleNamespace(
+        config=SimpleNamespace(
+            verbose=False,
+            loss_weighting=None,
+            sibling_overlap_loss_enabled=False,
+            sibling_overlap_loss_weight=0.0,
+            sibling_overlap_temperature=0.5,
+            sibling_overlap_topk=8,
+            anchor_chunk_size=anchor_chunk_size,
+            ce_chunk_size=None,
+        ),
+        tree_processor=tree_processor,
+        target=object(),
+        drafter=_CountingDrafter(),
+        lm_head=lambda x: x,
+        tokenizer=None,
+        sibling_pair_i=torch.tensor([], dtype=torch.long),
+        sibling_pair_j=torch.tensor([], dtype=torch.long),
+        num_sibling_pairs=0,
+    )
+    return _bind_trainer_methods(dummy_trainer)
+
+
+class _StaticTreeProcessor:
+    def __init__(self, training_extras: TrainingExtras, parent_idx: torch.Tensor):
+        self.training_extras = training_extras
+        self.parent_idx = parent_idx
+
+    def supports_anchor_chunking(self) -> bool:
+        return True
+
+    def get_parent_idx(self) -> torch.Tensor:
+        return self.parent_idx
+
+    def construct_training_extras(
+        self,
+        input_ids,
+        anchors,
+        document_mask,
+        position_ids,
+        target,
+        anchor_sequence_idx=None,
+        anchor_response_idx=None,
+    ):
+        return self.training_extras
+
+
+def _make_tree_info(parent_idx: torch.Tensor, tree_mask: torch.Tensor, batch_size: int, n_trees: int) -> TreeInfo:
+    tree_size = parent_idx.numel()
+    depth = torch.zeros(tree_size, dtype=torch.long)
+    for node_idx in range(tree_size):
+        curr_idx = int(node_idx)
+        while parent_idx[curr_idx] >= 0:
+            depth[node_idx] += 1
+            curr_idx = int(parent_idx[curr_idx].item())
+
+    is_leaf = torch.ones(tree_size, dtype=torch.bool)
+    is_leaf[parent_idx[parent_idx >= 0]] = False
+
+    return TreeInfo(
+        tree_mask=tree_mask.view(1, 1, tree_size, tree_size).expand(batch_size, n_trees, -1, -1),
+        parent_idx=parent_idx.view(1, 1, tree_size).expand(batch_size, n_trees, -1),
+        depth=depth.view(1, 1, tree_size).expand(batch_size, n_trees, -1),
+        is_leaf=is_leaf.view(1, 1, tree_size).expand(batch_size, n_trees, -1),
+        relation_map=torch.zeros(batch_size, n_trees, tree_size, tree_size, dtype=torch.long),
+        tree_position_ids=torch.arange(tree_size).view(1, 1, tree_size).expand(batch_size, n_trees, -1),
+    )
+
+
+def _make_static_trainer(
+    training_extras: TrainingExtras,
+    parent_idx: torch.Tensor,
+    *,
+    ce_chunk_size=None,
+    config_overrides=None,
+    q_head=None,
+):
+    config_overrides = config_overrides or {}
+    trainer = SimpleNamespace(
+        config=SimpleNamespace(
+            verbose=False,
+            loss_weighting=None,
+            sibling_overlap_loss_enabled=False,
+            sibling_overlap_loss_weight=0.0,
+            sibling_overlap_temperature=0.5,
+            sibling_overlap_topk=8,
+            anchor_chunk_size=None,
+            ce_chunk_size=ce_chunk_size,
+            **config_overrides,
+        ),
+        tree_processor=_StaticTreeProcessor(training_extras, parent_idx),
+        target=object(),
+        drafter=_CountingDrafter(q_head=q_head),
+        lm_head=lambda x: x,
+        tokenizer=None,
+    )
+    pred_parent_idx = parent_idx[1:]
+    same_parent = pred_parent_idx[:, None] == pred_parent_idx[None, :]
+    valid_parent = (pred_parent_idx[:, None] >= 0) & (pred_parent_idx[None, :] >= 0)
+    distinct_nodes = ~torch.eye(pred_parent_idx.shape[0], dtype=torch.bool)
+    upper_triangle = torch.triu(torch.ones_like(same_parent, dtype=torch.bool), diagonal=1)
+    sibling_pairs = (same_parent & valid_parent & distinct_nodes & upper_triangle).nonzero(as_tuple=False)
+    trainer.sibling_pair_i = sibling_pairs[:, 0]
+    trainer.sibling_pair_j = sibling_pairs[:, 1]
+    trainer.num_sibling_pairs = int(sibling_pairs.shape[0])
+    return _bind_trainer_methods(trainer)
+
+
+def _assert_loss_metrics_match(loss_a, metrics_a, loss_b, metrics_b, metric_keys):
+    assert torch.allclose(loss_a, loss_b, atol=1e-6, rtol=0.0)
+    for key in metric_keys:
+        value_a = metrics_a[key]
+        value_b = metrics_b[key]
+        if isinstance(value_a, torch.Tensor):
+            assert torch.allclose(value_a, value_b, atol=1e-6, rtol=0.0), key
+        else:
+            assert value_a == value_b, key
+
+
+def _make_dummy_batch(anchors: torch.Tensor) -> dict[str, torch.Tensor]:
+    input_ids = torch.zeros((1, 6), dtype=torch.long)
+    for anchor in anchors[0]:
+        input_ids[0, anchor + 1] = (anchor % 7) + 1
+    return {
+        "input_ids": input_ids,
+        "anchors": anchors,
+        "document_mask": torch.ones_like(input_ids),
+        "position_ids": torch.arange(input_ids.shape[1]).unsqueeze(0),
+        "anchor_sequence_idx": torch.arange(anchors.shape[1]).view(1, -1),
+        "anchor_response_idx": torch.arange(anchors.shape[1]).view(1, -1) + 10,
+    }
 
 
 def test_precomputed_tree_dataset_emits_anchor_lookup_metadata(tmp_path, monkeypatch):
@@ -237,6 +480,10 @@ def test_trainer_process_batch_passes_offline_anchor_metadata():
             loss_weighting=None,
             sibling_overlap_loss_enabled=False,
             sibling_overlap_loss_weight=0.0,
+            sibling_overlap_temperature=0.5,
+            sibling_overlap_topk=8,
+            anchor_chunk_size=None,
+            ce_chunk_size=None,
         ),
         tree_processor=RecordingTreeProcessor(),
         target=object(),
@@ -246,8 +493,8 @@ def test_trainer_process_batch_passes_offline_anchor_metadata():
         sibling_pair_i=torch.tensor([], dtype=torch.long),
         sibling_pair_j=torch.tensor([], dtype=torch.long),
         num_sibling_pairs=0,
-        _compute_sibling_overlap_loss=lambda tree_logits: tree_logits.new_zeros(()),
     )
+    dummy_trainer = _bind_trainer_methods(dummy_trainer)
 
     batch = {
         "input_ids": torch.tensor([[5, 6, 7, 8, 9, 0]]),
@@ -258,7 +505,7 @@ def test_trainer_process_batch_passes_offline_anchor_metadata():
         "anchor_response_idx": torch.tensor([[2, 3]]),
     }
 
-    loss, metrics = Trainer.process_batch(dummy_trainer, batch)
+    loss, metrics = dummy_trainer.process_batch(batch)
     assert torch.isfinite(loss)
     assert metrics["block_count"] == batch_size * n_trees
     assert torch.equal(dummy_trainer.tree_processor.anchor_sequence_idx, batch["anchor_sequence_idx"])
@@ -296,3 +543,232 @@ def test_every_branch_online_mode_still_uses_generate_labels():
     assert called["value"] is True
     assert extras.target_hidden_states is dummy_hidden_states
     assert torch.equal(extras.tree_labels, dummy_labels)
+
+
+def test_ce_chunking_matches_unchunked_loss_metrics():
+    parent_idx = torch.tensor([-1, 0])
+    tree_mask = torch.tensor([[True, False], [True, True]])
+    anchors = torch.tensor([[1, 3]])
+    input_ids = torch.tensor([[0, 0, 2, 0, 4, 0]])
+    noise_embds = torch.tensor(
+        [[
+            [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.1, 0.2, 2.5, 0.3, -0.4, -0.8]],
+            [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.3, -0.2, 0.1, 0.5, 2.0, -1.0]],
+        ]]
+    )
+    tree_labels = torch.tensor([[[0, 2], [0, 4]]])
+    tree_info = _make_tree_info(parent_idx, tree_mask, batch_size=1, n_trees=2)
+    training_extras = TrainingExtras(
+        tree_labels=tree_labels,
+        seq_labels=tree_labels,
+        tree_ar_prob=torch.ones_like(tree_labels, dtype=torch.float32),
+        tree_cum_prob=torch.ones_like(tree_labels, dtype=torch.float32),
+        noise_embds=noise_embds,
+        sequence_position_ids=anchors[:, :, None] + torch.arange(2).view(1, 1, 2),
+        target_hidden_states=[torch.zeros(1, input_ids.shape[1], noise_embds.shape[-1])],
+        tree_info=tree_info,
+    )
+    batch = {
+        "input_ids": input_ids,
+        "anchors": anchors,
+        "document_mask": torch.ones_like(input_ids),
+        "position_ids": torch.arange(input_ids.shape[1]).unsqueeze(0),
+    }
+
+    trainer_full = _make_static_trainer(training_extras, parent_idx)
+    trainer_chunked = _make_static_trainer(training_extras, parent_idx, ce_chunk_size=1)
+
+    loss_full, metrics_full = trainer_full.process_batch(batch)
+    loss_chunked, metrics_chunked = trainer_chunked.process_batch(batch)
+
+    _assert_loss_metrics_match(
+        loss_full,
+        metrics_full,
+        loss_chunked,
+        metrics_chunked,
+        ["lm_loss_sum", "token_correct_count", "accepted_length_sum", "block_count", "token_count"],
+    )
+
+
+def test_ce_chunking_matches_weighted_loss():
+    parent_idx = torch.tensor([-1, 0])
+    tree_mask = torch.tensor([[True, False], [True, True]])
+    anchors = torch.tensor([[1, 3]])
+    input_ids = torch.tensor([[0, 0, 2, 0, 4, 0]])
+    noise_embds = torch.tensor(
+        [[
+            [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.2, 0.1, 2.2, -0.3, -0.5, -1.0]],
+            [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.1, -0.2, 0.3, 0.4, 1.8, -0.6]],
+        ]]
+    )
+    tree_labels = torch.tensor([[[0, 2], [0, 4]]])
+    tree_cum_prob = torch.tensor([[[1.0, 0.2], [1.0, 0.8]]])
+    tree_info = _make_tree_info(parent_idx, tree_mask, batch_size=1, n_trees=2)
+    training_extras = TrainingExtras(
+        tree_labels=tree_labels,
+        seq_labels=tree_labels,
+        tree_ar_prob=torch.ones_like(tree_labels, dtype=torch.float32),
+        tree_cum_prob=tree_cum_prob,
+        noise_embds=noise_embds,
+        sequence_position_ids=anchors[:, :, None] + torch.arange(2).view(1, 1, 2),
+        target_hidden_states=[torch.zeros(1, input_ids.shape[1], noise_embds.shape[-1])],
+        tree_info=tree_info,
+    )
+    batch = {
+        "input_ids": input_ids,
+        "anchors": anchors,
+        "document_mask": torch.ones_like(input_ids),
+        "position_ids": torch.arange(input_ids.shape[1]).unsqueeze(0),
+    }
+
+    config_overrides = {"loss_weighting": "target_probs"}
+    trainer_full = _make_static_trainer(training_extras, parent_idx, config_overrides=config_overrides)
+    trainer_chunked = _make_static_trainer(
+        training_extras,
+        parent_idx,
+        ce_chunk_size=1,
+        config_overrides=config_overrides,
+    )
+
+    loss_full, metrics_full = trainer_full.process_batch(batch)
+    loss_chunked, metrics_chunked = trainer_chunked.process_batch(batch)
+
+    _assert_loss_metrics_match(
+        loss_full,
+        metrics_full,
+        loss_chunked,
+        metrics_chunked,
+        ["lm_loss_sum", "token_correct_count", "accepted_length_sum"],
+    )
+
+
+def test_ce_chunking_matches_sibling_overlap():
+    parent_idx = torch.tensor([-1, 0, 0])
+    tree_mask = torch.tensor(
+        [
+            [True, False, False],
+            [True, True, False],
+            [True, False, True],
+        ]
+    )
+    anchors = torch.tensor([[1]])
+    input_ids = torch.tensor([[0, 0, 1, 0]])
+    noise_embds = torch.tensor(
+        [[[
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 3.0, 2.2, 1.0, -0.2, -1.0],
+            [0.0, 2.8, 1.8, 1.1, -0.3, -1.2],
+        ]]]
+    )
+    tree_labels = torch.tensor([[[0, 1, 2]]])
+    tree_info = _make_tree_info(parent_idx, tree_mask, batch_size=1, n_trees=1)
+    training_extras = TrainingExtras(
+        tree_labels=tree_labels,
+        seq_labels=tree_labels,
+        tree_ar_prob=torch.ones_like(tree_labels, dtype=torch.float32),
+        tree_cum_prob=torch.tensor([[[1.0, 0.6, 0.4]]]),
+        noise_embds=noise_embds,
+        sequence_position_ids=torch.tensor([[[1, 2, 2]]]),
+        target_hidden_states=[torch.zeros(1, input_ids.shape[1], noise_embds.shape[-1])],
+        tree_info=tree_info,
+    )
+    batch = {
+        "input_ids": input_ids,
+        "anchors": anchors,
+        "document_mask": torch.ones_like(input_ids),
+        "position_ids": torch.arange(input_ids.shape[1]).unsqueeze(0),
+    }
+
+    config_overrides = {
+        "sibling_overlap_loss_enabled": True,
+        "sibling_overlap_loss_weight": 0.3,
+        "sibling_overlap_topk": 3,
+        "sibling_overlap_temperature": 0.75,
+    }
+    trainer_full = _make_static_trainer(training_extras, parent_idx, config_overrides=config_overrides)
+    trainer_chunked = _make_static_trainer(
+        training_extras,
+        parent_idx,
+        ce_chunk_size=1,
+        config_overrides=config_overrides,
+    )
+
+    loss_full, metrics_full = trainer_full.process_batch(batch)
+    loss_chunked, metrics_chunked = trainer_chunked.process_batch(batch)
+
+    _assert_loss_metrics_match(
+        loss_full,
+        metrics_full,
+        loss_chunked,
+        metrics_chunked,
+        [
+            "lm_loss_sum",
+            "sibling_overlap_loss_sum",
+            "sibling_argmax_collision_count",
+            "token_correct_count",
+            "accepted_length_sum",
+        ],
+    )
+
+
+def test_ce_chunking_matches_q_head_metrics():
+    parent_idx = torch.tensor([-1, 0])
+    tree_mask = torch.tensor([[True, False], [True, True]])
+    anchors = torch.tensor([[1, 3]])
+    input_ids = torch.tensor([[0, 0, 2, 0, 4, 0]])
+    noise_embds = torch.tensor(
+        [[
+            [[0.0, 0.0, 0.0, 0.0], [0.1, 2.0, 0.3, -0.2]],
+            [[0.0, 0.0, 0.0, 0.0], [0.5, -0.1, 1.7, 0.2]],
+        ]]
+    )
+    tree_labels = torch.tensor([[[0, 1], [0, 2]]])
+    tree_info = _make_tree_info(parent_idx, tree_mask, batch_size=1, n_trees=2)
+    training_extras = TrainingExtras(
+        tree_labels=tree_labels,
+        seq_labels=tree_labels,
+        tree_ar_prob=torch.ones_like(tree_labels, dtype=torch.float32),
+        tree_cum_prob=torch.ones_like(tree_labels, dtype=torch.float32),
+        noise_embds=noise_embds,
+        sequence_position_ids=anchors[:, :, None] + torch.arange(2).view(1, 1, 2),
+        target_hidden_states=[torch.zeros(1, input_ids.shape[1], noise_embds.shape[-1])],
+        tree_info=tree_info,
+    )
+    batch = {
+        "input_ids": input_ids,
+        "anchors": anchors,
+        "document_mask": torch.ones_like(input_ids),
+        "position_ids": torch.arange(input_ids.shape[1]).unsqueeze(0),
+    }
+
+    q_head_full = torch.nn.Linear(noise_embds.shape[-1], 1, bias=False)
+    with torch.no_grad():
+        q_head_full.weight.copy_(torch.tensor([[0.5, -0.25, 0.75, 0.1]]))
+    q_head_chunked = torch.nn.Linear(noise_embds.shape[-1], 1, bias=False)
+    q_head_chunked.load_state_dict(q_head_full.state_dict())
+
+    trainer_full = _make_static_trainer(training_extras, parent_idx, q_head=q_head_full)
+    trainer_chunked = _make_static_trainer(training_extras, parent_idx, ce_chunk_size=1, q_head=q_head_chunked)
+
+    loss_full, metrics_full = trainer_full.process_batch(batch)
+    loss_chunked, metrics_chunked = trainer_chunked.process_batch(batch)
+
+    _assert_loss_metrics_match(
+        loss_full,
+        metrics_full,
+        loss_chunked,
+        metrics_chunked,
+        ["lm_loss_sum", "q_loss_sum", "q_accuracy_count", "token_correct_count"],
+    )
+
+
+def test_ce_chunk_size_validation():
+    trainer = _make_dummy_trainer()
+
+    trainer.config.ce_chunk_size = 0
+    with pytest.raises(ValueError, match="ce_chunk_size"):
+        trainer._get_ce_chunk_size(4)
+
+    trainer.config.ce_chunk_size = -1
+    with pytest.raises(ValueError, match="ce_chunk_size"):
+        trainer._get_ce_chunk_size(4)

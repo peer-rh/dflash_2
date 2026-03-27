@@ -30,12 +30,16 @@ class BlockTree(TreeProcessor):
 
         )
 
-    def construct_candidate_extras(self, drafted_ids, sequence_position_ids, q_values):
+    def supports_anchor_chunking(self) -> bool:
+        return True
+
+    def construct_candidate_extras(self, drafted_ids, sequence_position_ids, q_values, draft_probs=None):
         return CandidateExtras(
             input_ids=drafted_ids[:, 0],
             sequence_position_ids=sequence_position_ids[:, 0],
             tree_masks=self.tree_mask[None, :],
-            parents_idx=self.parent_idx[None, :]
+            parents_idx=self.parent_idx[None, :],
+            draft_probs=draft_probs[:, 0] if draft_probs is not None else None,
         )
     
     def construct_inference_extras(self, input_ids, target):

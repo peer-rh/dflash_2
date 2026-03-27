@@ -49,6 +49,7 @@ class CandidateExtras:
     sequence_position_ids: torch.Tensor # [1, T']
     tree_masks: torch.Tensor # [1, T']
     parents_idx: torch.Tensor # [1, T']
+    draft_probs: torch.Tensor | None = None # [1, T'], p_draft per token (root = 1.0)
 
 @dataclass
 class InferenceExtras:
@@ -60,6 +61,9 @@ class TreeProcessor:
     parent_idx: torch.Tensor
     def __init__(self):
         pass
+
+    def supports_anchor_chunking(self) -> bool:
+        return False
 
     def construct_training_extras(
         self,
