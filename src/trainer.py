@@ -21,7 +21,7 @@ import wandb
 from wandb.integration.lightning.fabric import WandbLogger
 from lightning.fabric.utilities import AttributeDict
 
-from .trees import TreeProcessor
+from .trees import TreeInfo, TreeProcessor, TrainingExtras
 from .trees.block_tree import BlockTree
 from .trees.fixed_tree_prunable import PrunableTreeProcessor
 from .trees.every_branch_tree import EveryBranchTreeProcessor
@@ -53,6 +53,7 @@ class TrainerConfig:
     sibling_overlap_temperature: float = 0.5
     sibling_overlap_topk: int = 8
     devices: int = 1
+    anchor_chunk_size: int | None = None
 
 
 
@@ -154,6 +155,15 @@ class Trainer:
         else:
             raise ValueError(f"Unsupported tree type: {tree_type}")
 
+        if self.config.anchor_chunk_size is not None:
+            if self.config.anchor_chunk_size <= 0:
+                raise ValueError("`trainer.anchor_chunk_size` must be greater than 0 when set.")
+            if not self.tree_processor.supports_anchor_chunking():
+                raise ValueError(
+                    f"`trainer.anchor_chunk_size` is only supported for BlockTree or "
+                    f"EveryBranchTreeProcessor with offline labels; got tree_type={tree_type}."
+                )
+
         parent_idx = self.tree_processor.get_parent_idx()[1:]
         same_parent = parent_idx[:, None] == parent_idx[None, :]
         valid_parent = (parent_idx[:, None] >= 0) & (parent_idx[None, :] >= 0)
@@ -205,6 +215,276 @@ class Trainer:
 
         block_overlap = pair_overlap.mean(dim=-1)
         return block_overlap.sum() * tree_logits.shape[2]
+
+    def _get_anchor_chunk_size(self, n_trees: int) -> int | None:
+        anchor_chunk_size = getattr(self.config, "anchor_chunk_size", None)
+        if anchor_chunk_size is None:
+            return None
+        if anchor_chunk_size <= 0:
+            raise ValueError("`trainer.anchor_chunk_size` must be greater than 0 when set.")
+        supports_anchor_chunking = getattr(self.tree_processor, "supports_anchor_chunking", None)
+        is_supported = bool(supports_anchor_chunking()) if callable(supports_anchor_chunking) else False
+        if not is_supported:
+            raise ValueError(
+                "`trainer.anchor_chunk_size` is only supported for BlockTree or "
+                "EveryBranchTreeProcessor with offline labels."
+            )
+        if anchor_chunk_size >= n_trees:
+            return None
+        return anchor_chunk_size
+
+    def _slice_tree_info(self, tree_info: TreeInfo, start_idx: int, end_idx: int) -> TreeInfo:
+        return TreeInfo(
+            tree_mask=tree_info.tree_mask[:, start_idx:end_idx],
+            parent_idx=tree_info.parent_idx[:, start_idx:end_idx],
+            depth=tree_info.depth[:, start_idx:end_idx],
+            is_leaf=tree_info.is_leaf[:, start_idx:end_idx],
+            relation_map=tree_info.relation_map[:, start_idx:end_idx],
+            tree_position_ids=tree_info.tree_position_ids[:, start_idx:end_idx],
+        )
+
+    def _slice_training_extras(
+        self,
+        tree_extras: TrainingExtras,
+        start_idx: int,
+        end_idx: int,
+    ) -> TrainingExtras:
+        return TrainingExtras(
+            tree_labels=tree_extras.tree_labels[:, start_idx:end_idx],
+            seq_labels=tree_extras.seq_labels[:, start_idx:end_idx],
+            tree_ar_prob=tree_extras.tree_ar_prob[:, start_idx:end_idx],
+            tree_cum_prob=tree_extras.tree_cum_prob[:, start_idx:end_idx],
+            noise_embds=tree_extras.noise_embds[:, start_idx:end_idx],
+            sequence_position_ids=tree_extras.sequence_position_ids[:, start_idx:end_idx],
+            target_hidden_states=tree_extras.target_hidden_states,
+            tree_info=self._slice_tree_info(tree_extras.tree_info, start_idx, end_idx),
+        )
+
+    def _build_drafter_attention_mask(
+        self,
+        anchors: torch.Tensor,
+        document_mask: torch.Tensor,
+        seq_len: int,
+        tree_size: int,
+    ):
+        def mask_mod(B, _H, Q, KV):
+            Q_TREE = Q // tree_size
+            KV_TREE = ((KV - seq_len) // tree_size)
+            is_context = KV < seq_len
+            is_causal = KV < anchors[B, Q_TREE]
+            is_same_doc = (
+                document_mask[B, KV % seq_len] == document_mask[B, anchors[B, Q_TREE]]
+            )
+
+            is_same_tree = Q_TREE == KV_TREE
+            return (is_context & is_causal & is_same_doc) | (~is_context & is_same_tree)
+
+        B, N_T = anchors.shape
+        return create_block_mask(
+            mask_mod,
+            B,
+            None,
+            N_T * tree_size,
+            N_T * tree_size + seq_len,
+            device=anchors.device,
+            BLOCK_SIZE=128,
+        )
+
+    def _prepare_batch(self, batch):
+        input_ids = batch["input_ids"]  # [B, S]
+        anchors = batch["anchors"]  # [B, N_T]
+        document_mask = batch["document_mask"]  # [B, S]
+        position_ids = batch["position_ids"]  # [B, S]
+
+        with torch.no_grad():
+            tree_extras = self.tree_processor.construct_training_extras(
+                input_ids,
+                anchors,
+                document_mask,
+                position_ids,
+                self.target,
+                anchor_sequence_idx=batch.get("anchor_sequence_idx"),
+                anchor_response_idx=batch.get("anchor_response_idx"),
+            )
+            target_ctx_features = self.drafter.extract_ctx_features(tree_extras.target_hidden_states)
+
+        return SimpleNamespace(
+            input_ids=input_ids,
+            anchors=anchors,
+            document_mask=document_mask,
+            position_ids=position_ids,
+            tree_extras=tree_extras,
+            target_ctx_features=target_ctx_features,
+        )
+
+    def _compute_loss_and_metrics(
+        self,
+        input_ids: torch.Tensor,
+        anchors: torch.Tensor,
+        document_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        tree_extras: TrainingExtras,
+        target_ctx_features: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor | int]]:
+        B, S = input_ids.shape
+        tree_labels = tree_extras.tree_labels
+        B, N_T, T = tree_labels.shape
+        drafter_attention_mask = self._build_drafter_attention_mask(
+            anchors,
+            document_mask,
+            S,
+            T,
+        )
+        drafter_position_ids = torch.cat(
+            (
+                position_ids,
+                tree_extras.sequence_position_ids.view(B, N_T * T),
+            ),
+            dim=1,
+        )
+        if self.config.verbose:
+            print("--")
+            print("Drafter Inputs:")
+            print("Noise Embeddings:", tree_extras.noise_embds.shape)
+            print("Target Context Features:", target_ctx_features.shape)
+            print("Attention Mask:", drafter_attention_mask[0])
+
+        tree_hs, backbone_hidden = self.drafter(
+            hidden_states=tree_extras.noise_embds.view(B, N_T * T, -1),
+            target_ctx_features=target_ctx_features,
+            attention_mask=drafter_attention_mask,
+            position_ids=drafter_position_ids,
+            tree_info=tree_extras.tree_info,
+        )
+        tree_logits = self.lm_head(tree_hs.view(B, N_T, T, -1)[:, :, 1:]) # [B, N_T, T-1, N_VOCAB]
+        sibling_overlap_loss = self._compute_sibling_overlap_loss(tree_logits)
+
+        lm_loss = F.cross_entropy(
+            tree_logits.view(-1, tree_logits.size(-1)), tree_labels[:, :, 1:].reshape(-1), reduction="none"
+        ).view(B, N_T, T-1) # [B, N_T, T]
+        if self.config.loss_weighting is None:
+            lm_loss = lm_loss.sum()
+        elif self.config.loss_weighting == "target_probs":
+            with torch.no_grad():
+                cum_prod = tree_extras.tree_cum_prob[:, :, 1:].detach()
+                w = cum_prod / cum_prod.sum(dim=-1, keepdim=True).clamp(min=1e-8) * (T-1)
+                w = w.detach().clone()
+
+            lm_loss = (lm_loss * w).sum()
+
+        if self.config.verbose:
+            print('--')
+            print("Process_batch")
+            print("Tree Labels:",)
+            for i in range(tree_labels.shape[2]):
+                print(tree_extras.tree_cum_prob[0, 0, i].item(), " - ", self.tokenizer.decode(tree_labels[0, 0, tree_extras.tree_info.tree_mask[0, 0, i].bool()], skip_special_tokens=False).replace("\n", "\\n"))
+            print("Tree Preds:", self.tokenizer.decode(tree_logits.argmax(dim=-1)[0, 0]))
+            print("Verifier AR Probs:", tree_extras.tree_ar_prob[0, 0])
+            print("Verifier Cum Prods: ", tree_extras.tree_cum_prob[0, 0])
+            print("Loss:", lm_loss.item())
+        with torch.no_grad():
+            pred_ids = tree_logits.argmax(dim=-1)
+            is_correct = pred_ids == tree_labels[:, :, 1:] # [B, N_T, T-1]
+            sibling_pair_count = B * N_T * self.num_sibling_pairs
+            sibling_argmax_collision_count = pred_ids.new_zeros((), dtype=torch.long)
+            if self.num_sibling_pairs > 0:
+                sibling_argmax_collision_count = (
+                    pred_ids[:, :, self.sibling_pair_i] == pred_ids[:, :, self.sibling_pair_j]
+                ).sum()
+
+            target_labels_aligned = input_ids.gather(1, 
+                tree_extras.sequence_position_ids[:, :, 1:].reshape(B, N_T * (T - 1))
+            ).view(B, N_T, T - 1)
+            depth = tree_extras.sequence_position_ids[:, :, 1:] - anchors[:, :, None] # [B, N_T, T-1]
+            is_accepted = target_labels_aligned == pred_ids # [B, N_T, T-1]
+            is_accepted = (
+                is_accepted[:, :, None, :] & tree_extras.tree_info.tree_mask[:, :, 1:, 1:]
+            ).sum(dim=-1) == depth # [B, N_T, T-1]
+            best = (is_accepted * depth).max(dim=-1)
+            acceptance_length = best.values + 1
+            if self.config.verbose:
+                print('--')
+                print("Acceptance Info:")
+                print("Target Labels Aligned:", self.tokenizer.decode(target_labels_aligned[0, 0]))
+                print("Is Correct:", is_correct[0, 0])
+                print("Is Accepted:", is_accepted[0, 0])
+                print("Best:", best.values[0, 0])
+                print("Acceptance Length:", acceptance_length[0,0])
+
+        metrics: dict[str, torch.Tensor | int] = {
+            "lm_loss_sum": lm_loss.detach(),
+            "sibling_overlap_loss_sum": sibling_overlap_loss.detach(),
+            "batch_count": B,
+            "block_count": B * N_T,
+            "sibling_pair_count": sibling_pair_count,
+            "sibling_argmax_collision_count": sibling_argmax_collision_count.detach(),
+            "token_count": B * N_T * T,
+            "token_correct_count": is_correct.sum().detach(),
+            "accepted_length_sum": acceptance_length.sum().detach(),
+        }
+        total_loss = lm_loss + self.config.sibling_overlap_loss_weight * sibling_overlap_loss
+        if self.drafter.config.use_q_head:
+            q_values = self.drafter.q_head(tree_hs.view(B, N_T, T, -1)[:, :, 1:].to(self.drafter.q_head.weight.dtype))[:, :, :, 0] # type: ignore
+            q_loss = F.binary_cross_entropy_with_logits(q_values.view(-1), is_correct.view(-1).float(), reduction="sum")
+            total_loss = total_loss + 0.5 * q_loss
+            metrics["q_loss_sum"] = q_loss.detach()
+            metrics["q_accuracy_count"] = ((q_values > 0) == is_correct).sum().detach()
+            if self.config.verbose:
+                print(is_correct.shape, q_values.shape)
+                print('--')
+                print("Q-Head Info:")
+                print("Q Values:", q_values[0, 0])
+                print("Q Accuracy:", ((q_values > 0) == is_correct).sum(dim=-1)[0, 0])
+
+        return total_loss, metrics
+
+    def _process_prepared_batch(self, prepared_batch, do_backward: bool = False):
+        input_ids = prepared_batch.input_ids
+        anchors = prepared_batch.anchors
+        document_mask = prepared_batch.document_mask
+        position_ids = prepared_batch.position_ids
+        tree_extras = prepared_batch.tree_extras
+        target_ctx_features = prepared_batch.target_ctx_features
+
+        B, N_T, T = tree_extras.tree_labels.shape
+        denom = B * N_T * T
+        anchor_chunk_size = self._get_anchor_chunk_size(N_T)
+
+        if anchor_chunk_size is None:
+            total_loss, metrics = self._compute_loss_and_metrics(
+                input_ids,
+                anchors,
+                document_mask,
+                position_ids,
+                tree_extras,
+                target_ctx_features,
+            )
+            if do_backward:
+                self.fabric.backward(total_loss / denom)
+                total_loss = total_loss.detach()
+            return total_loss / denom, metrics
+
+        total_loss = torch.zeros((), device=input_ids.device)
+        metrics = None
+        for start_idx in range(0, N_T, anchor_chunk_size):
+            end_idx = min(start_idx + anchor_chunk_size, N_T)
+            chunk_loss, chunk_metrics = self._compute_loss_and_metrics(
+                input_ids,
+                anchors[:, start_idx:end_idx],
+                document_mask,
+                position_ids,
+                self._slice_training_extras(tree_extras, start_idx, end_idx),
+                target_ctx_features,
+            )
+            if do_backward:
+                self.fabric.backward(chunk_loss / denom)
+                total_loss = total_loss + chunk_loss.detach()
+            else:
+                total_loss = total_loss + chunk_loss
+            metrics = merge_metrics(metrics, chunk_metrics)
+
+        assert metrics is not None
+        return total_loss / denom, metrics
 
     def fit(self):
         for epoch in range(self.config.num_epochs):
@@ -383,174 +663,14 @@ class Trainer:
         return fig_sibling
 
     def process_batch(self, batch):
-        input_ids = batch["input_ids"]  # [B, S]
-        anchors = batch["anchors"]  # [B, N_T]
-        document_mask = batch["document_mask"]  # [B, S]
-        position_ids = batch["position_ids"]  # [B, S]
-        B, S = input_ids.shape
-
-        with torch.no_grad():
-            # start = wall_time()
-            tree_extras = self.tree_processor.construct_training_extras(
-                input_ids,
-                anchors,
-                document_mask,
-                position_ids,
-                self.target,
-                anchor_sequence_idx=batch.get("anchor_sequence_idx"),
-                anchor_response_idx=batch.get("anchor_response_idx"),
-            )
-            # end = wall_time()
-            # print("Tree extras constructed in", end - start)
-
-            tree_labels = tree_extras.tree_labels  # [B, N_T, T]
-            B, N_T, T = tree_labels.shape
-
-            # Run Drafter
-            def mask_mod(B, _H, Q, KV):
-                Q_TREE = Q // T
-                KV_TREE = ((KV - S) // T)
-                is_context = KV < S
-                is_causal = KV < anchors[B, Q_TREE]
-                is_same_doc = (
-                    document_mask[B, KV % S] == document_mask[B, anchors[B, Q_TREE]]
-                )
-
-                is_same_tree = Q_TREE == KV_TREE
-                return (is_context & is_causal & is_same_doc) | (~is_context & is_same_tree)
-
-            drafter_attention_mask = create_block_mask(
-                mask_mod,
-                B,
-                None,
-                N_T * T,
-                N_T * T + S,
-                device=input_ids.device,
-                BLOCK_SIZE=128,
-            )
-            # tree_pred :: [B, N_T, T, N_VOCAB]
-            target_ctx_features = self.drafter.extract_ctx_features(tree_extras.target_hidden_states)
-            drafter_position_ids = torch.cat(
-                (
-                    position_ids,
-                    tree_extras.sequence_position_ids.view(B, N_T * T),
-                ), dim=1
-            )
-        if self.config.verbose:
-            print("--")
-            print("Drafter Inputs:")
-            print("Noise Embeddings:", tree_extras.noise_embds.shape)
-            print("Target Context Features:", target_ctx_features.shape)
-            print("Attention Mask:", drafter_attention_mask[0])
-
-        tree_hs, backbone_hidden = self.drafter(
-            hidden_states=tree_extras.noise_embds.view(B, N_T * T, -1),
-            target_ctx_features=target_ctx_features,
-            attention_mask=drafter_attention_mask,
-            position_ids=drafter_position_ids,
-            tree_info=tree_extras.tree_info,
-        )
-        tree_logits = self.lm_head(tree_hs.view(B, N_T, T, -1)[:, :, 1:]) # [B, N_T, T-1, N_VOCAB]
-        sibling_overlap_loss = self._compute_sibling_overlap_loss(tree_logits)
-
-        lm_loss = F.cross_entropy(
-            tree_logits.view(-1, tree_logits.size(-1)), tree_labels[:, :, 1:].reshape(-1), reduction="none"
-        ).view(B, N_T, T-1) # [B, N_T, T]
-        if self.config.loss_weighting is None:
-            lm_loss = lm_loss.sum()
-        elif self.config.loss_weighting == "target_probs":
-            with torch.no_grad():
-                cum_prod = tree_extras.tree_cum_prob[:, :, 1:].detach()
-                # Make sure the weights sum to T as in unweighted case
-                w = cum_prod / cum_prod.sum(dim=-1, keepdim=True).clamp(min=1e-8) * (T-1)
-                w = w.detach().clone()  # fully sever from graph
-
-            lm_loss = (lm_loss * w).sum()
-        # targets = tree_labels[:, :, 1:]
-
-        # if self.config.loss_weighting is None:
-        #     log_probs = F.log_softmax(tree_logits, dim=-1)
-        #     lm_loss = -log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1).sum()
-        # elif self.config.loss_weighting == "target_probs":
-        #     with torch.no_grad():
-        #         w = tree_extras.tree_cum_prob[:, :, 1:]
-        #         w = w / w.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-        #         w = w * (T - 1)
-
-        #     log_probs = F.log_softmax(tree_logits, dim=-1)
-        #     gathered = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-        #     lm_loss = -(gathered * w).sum()
-
-        if self.config.verbose:
-            print('--')
-            print("Process_batch")
-            print("Tree Labels:",)
-            for i in range(tree_labels.shape[2]):
-                print(tree_extras.tree_cum_prob[0, 0, i].item(), " - ", self.tokenizer.decode(tree_labels[0, 0, tree_extras.tree_info.tree_mask[0, 0, i].bool()], skip_special_tokens=False).replace("\n", "\\n"))
-            print("Tree Preds:", self.tokenizer.decode(tree_logits.argmax(dim=-1)[0, 0]))
-            print("Verifier AR Probs:", tree_extras.tree_ar_prob[0, 0])
-            print("Verifier Cum Prods: ", tree_extras.tree_cum_prob[0, 0])
-            print("Loss:", lm_loss.item())
-        with torch.no_grad():
-            pred_ids = tree_logits.argmax(dim=-1)
-            is_correct = pred_ids == tree_labels[:, :, 1:] # [B, N_T, T-1]
-            sibling_pair_count = B * N_T * self.num_sibling_pairs
-            sibling_argmax_collision_count = pred_ids.new_zeros((), dtype=torch.long)
-            if self.num_sibling_pairs > 0:
-                sibling_argmax_collision_count = (
-                    pred_ids[:, :, self.sibling_pair_i] == pred_ids[:, :, self.sibling_pair_j]
-                ).sum()
-
-            target_labels_aligned = input_ids.gather(1, 
-                tree_extras.sequence_position_ids[:, :, 1:].reshape(B, N_T * (T - 1))
-            ).view(B, N_T, T - 1)
-            depth = tree_extras.sequence_position_ids[:, :, 1:] - anchors[:, :, None] # [B, N_T, T-1]
-            is_accepted = target_labels_aligned == pred_ids # [B, N_T, T-1]
-            is_accepted = (
-                is_accepted[:, :, None, :] & tree_extras.tree_info.tree_mask[:, :, 1:, 1:]
-            ).sum(dim=-1) == depth # [B, N_T, T-1]
-            best = (is_accepted * depth).max(dim=-1)
-            acceptance_length = best.values + 1
-            if self.config.verbose:
-                print('--')
-                print("Acceptance Info:")
-                print("Target Labels Aligned:", self.tokenizer.decode(target_labels_aligned[0, 0]))
-                print("Is Correct:", is_correct[0, 0])
-                print("Is Accepted:", is_accepted[0, 0])
-                print("Best:", best.values[0, 0])
-                print("Acceptance Length:", acceptance_length[0,0])
-
-        metrics = {
-            "lm_loss_sum": lm_loss.detach(),
-            "sibling_overlap_loss_sum": sibling_overlap_loss.detach(),
-            "batch_count": B,
-            "block_count": B * N_T,
-            "sibling_pair_count": sibling_pair_count,
-            "sibling_argmax_collision_count": sibling_argmax_collision_count.detach(),
-            "token_count": B * N_T * T,
-            "token_correct_count": is_correct.sum().detach(),
-            "accepted_length_sum": acceptance_length.sum().detach(),
-        }
-        loss = lm_loss + self.config.sibling_overlap_loss_weight * sibling_overlap_loss
-        if self.drafter.config.use_q_head:
-            q_values = self.drafter.q_head(tree_hs.view(B, N_T, T, -1)[:, :, 1:].to(self.drafter.q_head.weight.dtype))[:, :, :, 0] # type: ignore
-            q_loss = F.binary_cross_entropy_with_logits(q_values.view(-1), is_correct.view(-1).float(), reduction="sum")
-            loss = loss + 0.5 * q_loss
-            metrics["q_loss_sum"] = q_loss.detach()
-            metrics["q_accuracy_count"] = ((q_values > 0) == is_correct).sum().detach()
-            if self.config.verbose:
-                print(is_correct.shape, q_values.shape)
-                print('--')
-                print("Q-Head Info:")
-                print("Q Values:", q_values[0, 0])
-                print("Q Accuracy:", ((q_values > 0) == is_correct).sum(dim=-1)[0, 0])
-
-        return loss / (B * N_T * T), metrics
+        self._get_anchor_chunk_size(batch["anchors"].shape[1])
+        prepared_batch = self._prepare_batch(batch)
+        return self._process_prepared_batch(prepared_batch, do_backward=False)
 
     def _train_inner(self, batch):
-        loss, metrics = self.process_batch(batch)
-        self.fabric.backward(loss)
-        return loss, metrics
+        self._get_anchor_chunk_size(batch["anchors"].shape[1])
+        prepared_batch = self._prepare_batch(batch)
+        return self._process_prepared_batch(prepared_batch, do_backward=True)
 
     def train_step(self, batch, is_accumulating: bool = True):
         self.drafter.train()

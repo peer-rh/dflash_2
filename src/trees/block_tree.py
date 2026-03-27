@@ -30,6 +30,9 @@ class BlockTree(TreeProcessor):
 
         )
 
+    def supports_anchor_chunking(self) -> bool:
+        return True
+
     def construct_candidate_extras(self, drafted_ids, sequence_position_ids, q_values, draft_probs=None):
         return CandidateExtras(
             input_ids=drafted_ids[:, 0],

@@ -81,6 +81,9 @@ class EveryBranchTreeProcessor(TreeProcessor):
             tree_position_ids=torch.arange(self.tree_size, device=device)
         )
 
+    def supports_anchor_chunking(self) -> bool:
+        return self.labels_h5_path is not None
+
     def construct_training_extras(
         self,
         input_ids,

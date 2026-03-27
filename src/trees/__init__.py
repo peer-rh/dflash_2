@@ -62,6 +62,9 @@ class TreeProcessor:
     def __init__(self):
         pass
 
+    def supports_anchor_chunking(self) -> bool:
+        return False
+
     def construct_training_extras(
         self,
         input_ids,
