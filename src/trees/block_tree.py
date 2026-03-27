@@ -55,7 +55,16 @@ class BlockTree(TreeProcessor):
             sequence_position_ids=torch.arange(self.block_size, device=input_ids.device)[None, None, :] + input_ids.shape[1] - 1,
         )
 
-    def construct_training_extras(self, input_ids, anchors, document_mask, position_ids, target):
+    def construct_training_extras(
+        self,
+        input_ids,
+        anchors,
+        document_mask,
+        position_ids,
+        target,
+        anchor_sequence_idx=None,
+        anchor_response_idx=None,
+    ):
         B, N_B = anchors.shape
         B, S = input_ids.shape
 

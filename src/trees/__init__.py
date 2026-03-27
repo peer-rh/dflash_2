@@ -61,7 +61,16 @@ class TreeProcessor:
     def __init__(self):
         pass
 
-    def construct_training_extras(self, input_ids, anchors, document_mask, position_ids, target) -> TrainingExtras:
+    def construct_training_extras(
+        self,
+        input_ids,
+        anchors,
+        document_mask,
+        position_ids,
+        target,
+        anchor_sequence_idx: Optional[torch.Tensor] = None,
+        anchor_response_idx: Optional[torch.Tensor] = None,
+    ) -> TrainingExtras:
         """
         Inputs:
             input_ids: [B, S]
@@ -69,9 +78,11 @@ class TreeProcessor:
             document_mask: [B, S]
             position_ids: [B, S]
             target: Model
+            anchor_sequence_idx: [B, N_T] optional lookup ids for offline labels
+            anchor_response_idx: [B, N_T] optional response-row ids for offline labels
         Returns:
             tree_labels: [B, N_T, T]
-            noise_embds: [B, N_T, T, D] 
+            noise_embds: [B, N_T, T, D]
             sequence_position_ids: [B, N_T, T]
             tree_position_ids: [B, N_T, T]
             TODO: target_tree_probs: [B, N_T, T] # Probability of a random walk getting to this node using the verifier_probs

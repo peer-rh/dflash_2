@@ -1,5 +1,7 @@
 from typing import Sequence
 
+import h5py
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask
@@ -17,6 +19,7 @@ class EveryBranchTreeProcessor(TreeProcessor):
         n_compute_branches: int,
         mask_token_id: int,
         device: torch.device,
+        labels_h5_path: str | None = None,
     ) -> None:
         super().__init__()
         edges = [(0, 1), (0, 2), (0, 3), (1, 4), (1, 5), (2, 6), (2, 7)]
@@ -26,6 +29,9 @@ class EveryBranchTreeProcessor(TreeProcessor):
         self.depth = depth
         self.MASK_TOKEN_ID = mask_token_id
         self.top_k = torch.tensor(top_K, device=device)
+        self.labels_h5_path = labels_h5_path
+        self._labels_h5: h5py.File | None = None
+        self._labels_offsets: np.ndarray | None = None
 
         self.tree_size = depth * (len(edges) + 1)
         self.full_tree_mask = torch.zeros((self.tree_size, self.tree_size), dtype=torch.bool, device=device)
@@ -76,17 +82,43 @@ class EveryBranchTreeProcessor(TreeProcessor):
         )
 
     def construct_training_extras(
-        self, input_ids, anchors, document_mask, position_ids, target
+        self,
+        input_ids,
+        anchors,
+        document_mask,
+        position_ids,
+        target,
+        anchor_sequence_idx=None,
+        anchor_response_idx=None,
     ):
         B, S = input_ids.shape
         B, N_T = anchors.shape
-        target_hidden_states, tree_labels, tree_ar_prob, tree_cum_prob = self._generate_labels(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            document_masks=document_mask,
-            anchors=anchors,
-            target=target,
-        )  # target_hidden_states: [B, S, D], tree_labels: [B, N_T, T]
+        if self.labels_h5_path is None:
+            target_hidden_states, tree_labels, tree_ar_prob, tree_cum_prob = self._generate_labels(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                document_masks=document_mask,
+                anchors=anchors,
+                target=target,
+            )
+        else:
+            if anchor_sequence_idx is None or anchor_response_idx is None:
+                raise ValueError(
+                    "Offline EveryBranchTreeProcessor requires `anchor_sequence_idx` and "
+                    "`anchor_response_idx` in the batch."
+                )
+            target_hidden_states, _, _ = self._prefill_target(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                document_masks=document_mask,
+                target=target,
+                max_cache_len=S,
+            )
+            tree_labels, tree_ar_prob, tree_cum_prob = self._load_offline_labels(
+                anchor_sequence_idx=anchor_sequence_idx,
+                anchor_response_idx=anchor_response_idx,
+                device=input_ids.device,
+            )
 
         noise_input_ids = torch.gather(input_ids, 1, anchors)
         noise_input_ids = F.pad(
@@ -166,17 +198,77 @@ class EveryBranchTreeProcessor(TreeProcessor):
             ).view(1, 1, self.tree_size, -1),
         )
 
+    def _ensure_labels_h5(self) -> tuple[h5py.File, np.ndarray]:
+        if self.labels_h5_path is None:
+            raise RuntimeError("Offline labels were requested without `labels_h5_path`.")
+        if self._labels_h5 is None:
+            self._labels_h5 = h5py.File(self.labels_h5_path, "r")
+            self._labels_offsets = np.asarray(self._labels_h5["sequence_offsets"][:], dtype=np.int64)
+            if self._labels_h5["sub_trees"].shape[1] != self.tree_size:
+                raise ValueError(
+                    "Offline tree label width does not match the hardcoded Every Branch "
+                    f"tree size: h5={self._labels_h5['sub_trees'].shape[1]} processor={self.tree_size}"
+                )
+            if self._labels_h5["sub_trees_ar_probs"].shape[1] != self.tree_size:
+                raise ValueError(
+                    "Offline tree probability width does not match the hardcoded Every "
+                    f"Branch tree size: h5={self._labels_h5['sub_trees_ar_probs'].shape[1]} processor={self.tree_size}"
+                )
+            if self._labels_offsets.shape[0] != self._labels_h5["prompt_ids"].shape[0] + 1:
+                raise ValueError(
+                    "Invalid offline label file: `sequence_offsets` length must be "
+                    "`len(prompt_ids) + 1`."
+                )
+        assert self._labels_offsets is not None
+        return self._labels_h5, self._labels_offsets
+
+    @torch.no_grad()
+    def _load_offline_labels(
+        self,
+        *,
+        anchor_sequence_idx: torch.Tensor,
+        anchor_response_idx: torch.Tensor,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        labels_h5, sequence_offsets = self._ensure_labels_h5()
+        seq_idx = anchor_sequence_idx.detach().cpu().numpy().astype(np.int64, copy=False).reshape(-1)
+        resp_idx = anchor_response_idx.detach().cpu().numpy().astype(np.int64, copy=False).reshape(-1)
+        if (seq_idx < 0).any() or (resp_idx < 0).any():
+            raise ValueError("Offline Every Branch anchors must point to response tokens.")
+
+        row_ids = sequence_offsets[seq_idx] + resp_idx
+        max_rows = labels_h5["sub_trees"].shape[0]
+        if (row_ids < 0).any() or (row_ids >= max_rows).any():
+            raise IndexError("Offline Every Branch row lookup is out of bounds for the HDF5 label file.")
+
+        tree_labels_np = np.stack([labels_h5["sub_trees"][int(row_id)] for row_id in row_ids], axis=0)
+        tree_ar_prob_np = np.stack(
+            [labels_h5["sub_trees_ar_probs"][int(row_id)] for row_id in row_ids],
+            axis=0,
+        )
+
+        batch_shape = anchor_sequence_idx.shape
+        tree_labels = torch.from_numpy(tree_labels_np).to(device=device, dtype=torch.long).view(*batch_shape, self.tree_size)
+        tree_ar_prob = torch.from_numpy(tree_ar_prob_np).to(device=device, dtype=torch.float32).view(*batch_shape, self.tree_size)
+        tree_ar_prob[:, :, 0] = 1.0
+        tree_cum_prob = torch.where(
+            self.full_tree_mask,
+            tree_ar_prob[:, :, None, :],
+            1.0,
+        ).prod(dim=-1)
+        return tree_labels, tree_ar_prob, tree_cum_prob.detach()
+
     @torch.no_grad()
     @torch.compiler.disable()
-    def _generate_labels(
+    def _prefill_target(
         self,
+        *,
         input_ids,
         position_ids,
         document_masks,
-        anchors,
         target,
+        max_cache_len: int,
     ):
-        B, N_B = anchors.shape
         B, S = input_ids.shape
 
         def prefill_mask_mod(B, _H, Q, KV):
@@ -195,21 +287,38 @@ class EveryBranchTreeProcessor(TreeProcessor):
 
         past_key_values = StaticCache(
             config=target.config,
-            max_cache_len=S + self.n_compute_branches,
+            max_cache_len=max_cache_len,
         )
         prefill_cache_position = torch.arange(S, device=input_ids.device)
-
         prefill_out = target(
             input_ids=input_ids,
             position_ids=position_ids,
-            # output_hidden_states=True,
             attn_mask=prefill_mask,
             past_key_values=past_key_values,
             cache_position=prefill_cache_position,
             use_cache=True,
         )
-        target_hidden_states = prefill_out.hidden_states
-        logits = prefill_out.logits
+        return prefill_out.hidden_states, prefill_out.logits, past_key_values
+
+    @torch.no_grad()
+    @torch.compiler.disable()
+    def _generate_labels(
+        self,
+        input_ids,
+        position_ids,
+        document_masks,
+        anchors,
+        target,
+    ):
+        B, N_B = anchors.shape
+        B, S = input_ids.shape
+        target_hidden_states, logits, past_key_values = self._prefill_target(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            document_masks=document_masks,
+            target=target,
+            max_cache_len=S + self.n_compute_branches,
+        )
 
         tree_labels = torch.full(
             (B, N_B, self.tree_size), self.MASK_TOKEN_ID, dtype=torch.long, device=input_ids.device

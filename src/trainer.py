@@ -392,7 +392,13 @@ class Trainer:
         with torch.no_grad():
             # start = wall_time()
             tree_extras = self.tree_processor.construct_training_extras(
-                input_ids, anchors, document_mask, position_ids, self.target
+                input_ids,
+                anchors,
+                document_mask,
+                position_ids,
+                self.target,
+                anchor_sequence_idx=batch.get("anchor_sequence_idx"),
+                anchor_response_idx=batch.get("anchor_response_idx"),
             )
             # end = wall_time()
             # print("Tree extras constructed in", end - start)

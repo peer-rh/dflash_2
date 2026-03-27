@@ -105,7 +105,14 @@ class PrunableTreeProcessor(TreeProcessor):
         )
 
     def construct_training_extras(
-        self, input_ids, anchors, document_mask, position_ids, target
+        self,
+        input_ids,
+        anchors,
+        document_mask,
+        position_ids,
+        target,
+        anchor_sequence_idx=None,
+        anchor_response_idx=None,
     ):
         B, S = input_ids.shape
         B, N_T = anchors.shape
