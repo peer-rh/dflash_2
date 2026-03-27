@@ -142,13 +142,14 @@ class EveryBranchTreeProcessor(TreeProcessor):
             tree_info=expand_tree_info(self.tree_info, (B, N_T)),
         )
 
-    def construct_candidate_extras(self, drafted_ids: torch.Tensor, inference_extras: InferenceExtras, q_values: torch.Tensor) -> CandidateExtras:
+    def construct_candidate_extras(self, drafted_ids: torch.Tensor, inference_extras: InferenceExtras, q_values: torch.Tensor, draft_probs: torch.Tensor | None = None) -> CandidateExtras:
         if self.n_candidate_tokens is None:
             return CandidateExtras(
                 input_ids=drafted_ids[:, 0],
                 sequence_position_ids=inference_extras.sequence_position_ids[:, 0],
                 tree_masks=inference_extras.tree_info.tree_mask[:, 0],
                 parents_idx=inference_extras.tree_info.parent_idx[:, 0],
+                draft_probs=draft_probs[:, 0] if draft_probs is not None else None,
             )
         assert drafted_ids.shape[1] == 1, "Drafted ids should have n_blocks of 1"
         cumulative_prob = torch.where(
@@ -182,7 +183,7 @@ class EveryBranchTreeProcessor(TreeProcessor):
             sequence_position_ids=inference_extras.sequence_position_ids[:, 0, candidate_idxs],
             tree_masks=self.full_tree_mask[None, :, candidate_idxs][:, candidate_idxs],
             parents_idx=remapped_parents[None, :],
-
+            draft_probs=draft_probs[:, 0, candidate_idxs] if draft_probs is not None else None,
         )
 
     def construct_inference_extras(self, input_ids, target):

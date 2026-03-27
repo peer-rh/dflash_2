@@ -656,6 +656,10 @@ class Trainer:
                 q_values[:, :, 0] = 1.0
             drafter_preds = sample(drafter_logits, 0.0).view(1, N_T, T)  # [1, N_T, T]
             drafter_preds[:, :, 0] = output_ids[0, curr_pos]
+            draft_probs = F.softmax(drafter_logits, dim=-1).gather(
+                2, drafter_preds.view(1, N_T * T, 1)
+            ).view(1, N_T, T)  # [1, N_T, T]
+            draft_probs[:, :, 0] = 1.0  # root/anchor token always p=1
             past_key_values_drafter.crop(curr_pos)  # Discard drafted tokens from cache
             if self.config.verbose:
                 print("--")
@@ -671,6 +675,7 @@ class Trainer:
                 drafted_ids=drafter_preds,
                 inference_extras=inference_extras,
                 q_values=q_values,
+                draft_probs=draft_probs,
             )
 
             # print("Candidates:", self.tokenizer.decode(candidate_extras.input_ids[0]).replace("\n", "\\n"))
@@ -712,11 +717,36 @@ class Trainer:
                 print("verifier:", verifier_preds_aligned[0])
 
             depth = candidate_extras.sequence_position_ids - curr_pos
-            is_equal = candidate_extras.input_ids[:, 1:] == verifier_preds_aligned
-            is_equal = (
-                is_equal[:, None, :] & candidate_extras.tree_masks[:, :, 1:]
-            ).sum(dim=-1) == depth
-            best = (is_equal * depth).max(dim=-1)
+
+            # Compute p_target(draft_token) for each non-root candidate token using rejection sampling
+            parents = candidate_extras.parents_idx[0, 1:]  # [T'-1]
+            verifier_logits_at_parents = verifier_out.logits[0, parents]  # [T'-1, V]
+            temp = (
+                self.config.target_temperature
+                if self.config.target_temperature > 0
+                else 1.0
+            )
+            p_target_for_draft = (verifier_logits_at_parents / temp).softmax(dim=-1).gather(
+                1, candidate_extras.input_ids[0, 1:, None]
+            ).squeeze(1)  # [T'-1]
+
+            # Stochastic rejection: accept token with prob min(1, p_target / p_draft)
+            p_draft = (
+                candidate_extras.draft_probs[0, 1:]
+                if candidate_extras.draft_probs is not None
+                else torch.ones_like(p_target_for_draft)
+            )  # [T'-1]
+            acceptance_ratio = (p_target_for_draft / p_draft.clamp(min=1e-9)).clamp(max=1.0)
+            token_accepted = (
+                torch.rand_like(acceptance_ratio) < acceptance_ratio
+            )  # [T'-1]
+
+            # Path to vertex v is accepted iff every ancestor token is accepted
+            path_accepted = (
+                ~candidate_extras.tree_masks[:, :, 1:] | token_accepted[None, None, :]
+            ).all(dim=-1)  # [1, T']
+
+            best = (path_accepted.float() * depth).max(dim=-1)
             best_vertex = best.indices[0]
             acceptance_length = best.values[0].item() + 1
             acceptance_mask = candidate_extras.tree_masks[0, best_vertex]
