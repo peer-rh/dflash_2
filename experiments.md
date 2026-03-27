@@ -100,6 +100,7 @@ Parameterised by `seq_depth` and `sub_tree`.
 - **None** — pass the full tree to the verifier.
 - **Q_Logit** — `linear(drafter_hs) → [0,1]` estimates per-token correctness probability. Keep the subtree maximising expected accepted depth; prune to `n_candidate_tokens`.
 - **AR_Head** — `ar_layer(backbone_hs, input_embds_of_parent)` predicts the upcoming distribution as a q-value. The drafter has a backbone → diffusion head → LM head pipeline; AR_Head reuses backbone hidden states plus the sampled token embeddings. Can also be used to expand tree width.
+    - backbone_hs is the second to last layer from the diffusion module 
 
 ### Speculative Decoding Optimisation
 Improves the probability distribution used in rejection sampling (inference-time, drafter-side).

@@ -6,7 +6,13 @@ import numpy as np
 import pytest
 import torch
 
-from src.data.data_module import DataModule, DataModuleConfig, setup_precomputed_tree_dataset
+import src.data.data_module as data_module_module
+from src.data.data_module import (
+    DataModule,
+    DataModuleConfig,
+    _pack_token_sequences,
+    setup_precomputed_tree_dataset,
+)
 from src.trainer import Trainer
 from src.trees import TrainingExtras, TreeInfo
 from src.trees.block_tree import BlockTree
@@ -47,6 +53,51 @@ def _create_precomputed_tree_h5(path: Path, tree_size: int = 16) -> tuple[list[l
         hf.create_dataset("sequence_offsets", data=np.asarray(offsets, dtype=np.int64))
 
     return prompt_ids, response_ids
+
+
+def _pack_precomputed_tree_h5_eager(
+    path: Path,
+    *,
+    pad_token_id: int,
+    seq_len: int,
+    block_size: int,
+) -> list[dict[str, list[int] | list[list[int]]]]:
+    with h5py.File(path, "r") as hf:
+        prompt_ids = [np.asarray(ids, dtype=np.int64).tolist() for ids in hf["prompt_ids"]]
+        response_ids = [np.asarray(ids, dtype=np.int64).tolist() for ids in hf["response_ids"]]
+
+    packed = _pack_token_sequences(
+        prompt_ids,
+        response_ids,
+        seq_len=seq_len,
+        block_size=block_size,
+        pad_token_id=pad_token_id,
+        sequence_indices=list(range(len(prompt_ids))),
+    )
+
+    samples = []
+    for idx in range(len(packed["input_ids"])):
+        sample = {
+            "input_ids": packed["input_ids"][idx],
+            "masks": packed["masks"][idx],
+            "position_ids": packed["position_ids"][idx],
+            "answer_intervals": packed["answer_intervals"][idx],
+        }
+        if "response_sequence_idx" in packed:
+            sample["response_sequence_idx"] = packed["response_sequence_idx"][idx]
+        if "response_row_idx" in packed:
+            sample["response_row_idx"] = packed["response_row_idx"][idx]
+        samples.append(sample)
+    return samples
+
+
+def _normalize_packed_sample(sample: dict[str, list[int] | list[list[int]]]) -> tuple:
+    def normalize(value):
+        if isinstance(value, list):
+            return tuple(normalize(item) for item in value)
+        return value
+
+    return tuple((key, normalize(sample[key])) for key in sorted(sample))
 
 
 class _DummyTokenizer:
@@ -343,6 +394,76 @@ def test_precomputed_tree_dataset_emits_anchor_lookup_metadata(tmp_path, monkeyp
         assert seq_idx >= 0
         assert resp_idx >= 0
         assert token == response_ids[seq_idx][resp_idx]
+
+
+def test_precomputed_tree_dataset_chunked_matches_eager_reference(tmp_path):
+    h5_path = tmp_path / "trees.h5"
+    _create_precomputed_tree_h5(h5_path)
+
+    expected_samples = _pack_precomputed_tree_h5_eager(
+        h5_path,
+        pad_token_id=0,
+        seq_len=32,
+        block_size=2,
+    )
+    expected_normalized = sorted(_normalize_packed_sample(sample) for sample in expected_samples)
+
+    datasets = []
+    for chunk_size in (1, 2):
+        dataset, _ = setup_precomputed_tree_dataset(
+            str(h5_path),
+            0,
+            32,
+            2,
+            seed=42,
+            n_validation=0,
+            precomputed_tree_read_chunk_size=chunk_size,
+        )
+        datasets.append(dataset)
+
+    for dataset in datasets:
+        actual_normalized = sorted(
+            _normalize_packed_sample(dataset[idx]) for idx in range(len(dataset))
+        )
+        assert actual_normalized == expected_normalized
+
+
+def test_data_module_preprocess_supports_chunked_h5_with_loader_workers(tmp_path, monkeypatch):
+    h5_path = tmp_path / "trees.h5"
+    _create_precomputed_tree_h5(h5_path)
+    monkeypatch.setattr("src.data.data_module.AutoTokenizer.from_pretrained", lambda _: _DummyTokenizer())
+    original_from_generator = data_module_module.Dataset.from_generator
+    captured_kwargs: dict[str, object] = {}
+
+    def recording_from_generator(cls, generator, *args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return original_from_generator(generator, *args, **kwargs)
+
+    monkeypatch.setattr(
+        data_module_module.Dataset,
+        "from_generator",
+        classmethod(recording_from_generator),
+    )
+
+    config = DataModuleConfig(
+        precomputed_tree_path=str(h5_path),
+        precomputed_tree_read_chunk_size=1,
+        batch_size=1,
+        seq_len=32,
+        n_blocks=2,
+        block_size=2,
+        num_workers=3,
+        n_validation_samples=0,
+        quality_datasets=[],
+    )
+    data_module = DataModule(config, target="dummy")
+    data_module.preprocess()
+
+    assert len(data_module.train_dataset) > 0
+    sample = data_module.train_dataset[0]
+    assert "num_proc" not in captured_kwargs
+    assert "response_sequence_idx" in sample
+    assert "response_row_idx" in sample
 
 
 def test_every_branch_offline_labels_load_from_h5(tmp_path):

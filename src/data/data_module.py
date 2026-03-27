@@ -21,6 +21,7 @@ class DataModuleConfig:
     n_blocks: int = 64
     block_size: int = 16
     precomputed_tree_path: str | None = None
+    precomputed_tree_read_chunk_size: int = 512
 
     num_workers: int = 4
     seed: int = 42
@@ -173,16 +174,26 @@ def setup_precomputed_tree_dataset(
     block_size: int,
     seed: int,
     n_validation: int,
+    precomputed_tree_read_chunk_size: int = 512,
     num_workers: int = 4,
 ) -> tuple[Dataset, Dataset]:
+    if precomputed_tree_read_chunk_size <= 0:
+        raise ValueError("`precomputed_tree_read_chunk_size` must be greater than 0.")
+
     with h5py.File(precomputed_tree_path, "r") as hf:
-        prompt_ids = [np.asarray(ids, dtype=np.int64).tolist() for ids in hf["prompt_ids"]]
-        response_ids = [np.asarray(ids, dtype=np.int64).tolist() for ids in hf["response_ids"]]
+        prompt_ids_ds = hf["prompt_ids"]
+        response_ids_ds = hf["response_ids"]
         sequence_offsets = np.asarray(hf["sequence_offsets"][:], dtype=np.int64)
         sub_trees = hf["sub_trees"]
         sub_trees_ar_probs = hf["sub_trees_ar_probs"]
 
-        if sequence_offsets.shape[0] != len(prompt_ids) + 1:
+        n_sequences = int(prompt_ids_ds.shape[0])
+        if response_ids_ds.shape[0] != n_sequences:
+            raise ValueError(
+                "Invalid precomputed tree HDF5: `prompt_ids` and `response_ids` must "
+                "have the same number of sequences."
+            )
+        if sequence_offsets.shape[0] != n_sequences + 1:
             raise ValueError(
                 "Invalid precomputed tree HDF5: `sequence_offsets` must have exactly "
                 "len(prompt_ids) + 1 entries."
@@ -194,32 +205,44 @@ def setup_precomputed_tree_dataset(
                 "`sub_trees_ar_probs` do not match `sequence_offsets[-1]`."
             )
 
-    n_sequences = len(prompt_ids)
     print(f"Loaded precomputed tree HDF5 with {n_sequences} sequences. Processing...")
 
-    raw_dataset = Dataset.from_dict({
-        "prompt_ids": prompt_ids,
-        "response_ids": response_ids,
-    })
+    def generate_packed_samples():
+        with h5py.File(precomputed_tree_path, "r") as hf:
+            prompt_ids_ds = hf["prompt_ids"]
+            response_ids_ds = hf["response_ids"]
+            for start_idx in range(0, n_sequences, precomputed_tree_read_chunk_size):
+                end_idx = min(start_idx + precomputed_tree_read_chunk_size, n_sequences)
+                prompt_ids = [
+                    np.asarray(ids, dtype=np.int64).tolist()
+                    for ids in prompt_ids_ds[start_idx:end_idx]
+                ]
+                response_ids = [
+                    np.asarray(ids, dtype=np.int64).tolist()
+                    for ids in response_ids_ds[start_idx:end_idx]
+                ]
+                packed = _pack_token_sequences(
+                    prompt_ids,
+                    response_ids,
+                    seq_len=seq_len,
+                    block_size=block_size,
+                    pad_token_id=pad_token_id,
+                    sequence_indices=list(range(start_idx, end_idx)),
+                )
+                n_packed = len(packed["input_ids"])
+                for packed_idx in range(n_packed):
+                    sample = {
+                        "input_ids": packed["input_ids"][packed_idx],
+                        "masks": packed["masks"][packed_idx],
+                        "position_ids": packed["position_ids"][packed_idx],
+                        "answer_intervals": packed["answer_intervals"][packed_idx],
+                    }
+                    if "response_sequence_idx" in packed and "response_row_idx" in packed:
+                        sample["response_sequence_idx"] = packed["response_sequence_idx"][packed_idx]
+                        sample["response_row_idx"] = packed["response_row_idx"][packed_idx]
+                    yield sample
 
-    def pack_batch(batch, indices):
-        return _pack_token_sequences(
-            batch["prompt_ids"],
-            batch["response_ids"],
-            seq_len=seq_len,
-            block_size=block_size,
-            pad_token_id=pad_token_id,
-            sequence_indices=list(indices),
-        )
-
-    dataset = raw_dataset.map(
-        pack_batch,
-        batched=True,
-        batch_size=10_000,
-        with_indices=True,
-        num_proc=num_workers,
-        remove_columns=raw_dataset.column_names,
-    )
+    dataset = Dataset.from_generator(generate_packed_samples)
 
     dataset = dataset.shuffle(seed=seed)
     print(
@@ -262,6 +285,7 @@ class DataModule:
                 self.config.block_size,
                 self.config.seed,
                 self.config.n_validation_samples,
+                self.config.precomputed_tree_read_chunk_size,
                 self.config.num_workers,
             )
         else:
